@@ -1,21 +1,21 @@
 # Wang Local
 
-Wang Local is a local Node.js wrapper around a bundled Wang canvas frontend. It serves the saved frontend assets, provides local/mock API adapters, and can forward image-generation requests to an OpenAI-compatible image endpoint.
+Wang Local 是一个本地 Node.js 适配项目，用来运行已经打包好的 Wang 无限画布前端。它会在本地提供静态资源服务、补齐部分本地 API、模拟或代理后端接口，并在配置完成后把图片生成请求发送到 OpenAI 兼容的图片生成接口。
 
-The project is intended for local development, UI restoration, workflow testing, and lightweight backup of the current runnable state.
+这个项目主要用于本地开发、界面恢复、工作流测试，以及保存当前可运行版本的干净备份。
 
-![Wang Local workspace screenshot](docs/screenshot.png)
+![Wang Local 工作台截图](docs/screenshot.png)
 
-## Features
+## 功能概览
 
-- Serves the bundled Wang canvas frontend from `wang-local/`.
-- Provides local authentication and settings patches through `auth-mock.js` and `settings-ui.js`.
-- Supports OpenAI-compatible image generation configuration, including multiple API profiles and a streaming toggle.
-- Supports local image-to-image style workflows used by pose reference and camera-angle adjustment.
-- Stores local generated media, canvas sessions, generation history, and asset-library data under `wang-local/generated/`.
-- Keeps local secrets, generated media, dependency folders, and browser-save artifacts out of Git.
+- 从 `wang-local/` 启动并运行打包后的 Wang 画布前端。
+- 通过 `auth-mock.js` 和 `settings-ui.js` 提供本地登录、鉴权和服务设置补丁。
+- 支持 OpenAI 兼容图片生成配置，包括多个 API 配置、独立 key、模型选择和流式开关。
+- 支持姿势参考、相机角度调整等图生图类本地流程。
+- 支持本地生成历史、画布会话、素材库和生成媒体文件存储。
+- 自动忽略本地密钥、生成文件、依赖目录和浏览器另存网页产生的冗余文件。
 
-## Project Structure
+## 项目结构
 
 ```text
 .
@@ -33,13 +33,13 @@ The project is intended for local development, UI restoration, workflow testing,
     `-- settings-ui.js
 ```
 
-## Requirements
+## 环境要求
 
-- Node.js 18 or newer
+- Node.js 18 或更高版本
 - npm
-- An OpenAI-compatible image-generation API, if real generation is required
+- 如需真实生成图片，需要一个 OpenAI 兼容的图片生成 API
 
-## Quick Start
+## 快速启动
 
 ```bash
 cd wang-local
@@ -47,56 +47,56 @@ npm install
 npm run dev
 ```
 
-Open the local workspace:
+启动后打开：
 
 ```text
 http://localhost:3456/workflow?workspaceId=demo
 ```
 
-The default port is `3456`. It can be changed in `wang-local/config.json`.
+默认端口是 `3456`，可以在 `wang-local/config.json` 里修改。
 
-## Configuration
+## 配置说明
 
-Copy the example config and fill in your local API settings:
+先复制配置模板：
 
 ```bash
 cp wang-local/config.example.json wang-local/config.json
 ```
 
-Important fields:
+常用字段：
 
-- `port`: local server port.
-- `apiBaseUrl`: upstream OpenAI-compatible API base URL.
-- `apiKey`: API key for the default upstream.
-- `openaiProfiles`: multiple independent OpenAI-compatible API profiles.
-- `activeOpenaiProfileId`: selected API profile.
-- `openaiStreamingEnabled`: whether to send streaming requests by default.
-- `outputFormat`: default image output format.
+- `port`：本地服务端口。
+- `apiBaseUrl`：OpenAI 兼容接口地址。
+- `apiKey`：默认接口 key。
+- `openaiProfiles`：多个独立的 OpenAI 兼容 API 配置。
+- `activeOpenaiProfileId`：当前启用的 API 配置。
+- `openaiStreamingEnabled`：是否默认使用流式请求。
+- `outputFormat`：默认图片输出格式。
 
-`wang-local/config.json` is intentionally ignored by Git because it can contain API keys.
+`wang-local/config.json` 可能包含 API key，所以不会提交到 GitHub。
 
-If `config.json` is missing, the server starts with safe mock defaults so the UI can still be inspected locally.
+如果没有 `config.json`，服务也可以用安全的 mock 默认配置启动，方便本地查看界面。
 
-## Local Data
+## 本地数据
 
-Runtime data is written under:
+运行时数据会写入：
 
 ```text
 wang-local/generated/
 wang-local/tmp/
 ```
 
-These folders are local-only and are not backed up to GitHub.
+这些目录只保留在本地，不会备份到 GitHub。
 
-## Current Status
+## 当前完成度
 
-The local canvas, settings panel, image-generation routing, pose reference flow, camera-angle flow, asset library, and generation-history storage are partially restored for local use.
+目前本地画布、服务设置、图片生成路由、姿势参考、相机角度调整、素材库、生成历史等功能已经做了本地适配，可以用于基础测试。
 
-Some product areas are still mocked or incomplete, including membership/payment, community showcase, competition modules, notifications, invite codes, operation logs, world models, audio/music/lyrics, lip-sync, video rendering, CapCut export, and template marketplace APIs.
+仍然没有完整实现或仍是 mock 的部分包括：会员支付、社区展示、比赛活动、通知、邀请码、操作日志、积分体系、世界模型、音频/音乐/歌词、口型同步、视频渲染、剪映导出、模板市场等。
 
-See `PROJECT_AUDIT.md` for the detailed audit.
+详细审计见 `PROJECT_AUDIT.md`。
 
-## Useful Commands
+## 常用命令
 
 ```bash
 cd wang-local
@@ -104,15 +104,16 @@ npm run dev
 node --check server.js
 ```
 
-## Backup Notes
+## 备份策略
 
-The Git backup includes only the runnable local project and documentation. It excludes:
+GitHub 备份只包含可运行项目和必要文档，不包含本地临时数据。
 
-- API keys and local config
-- generated images and sessions
-- uploaded temporary files
+已忽略内容包括：
+
+- API key 和本地配置文件
+- 生成图片、上传文件和会话数据
 - `node_modules`
-- Playwright traces and screenshots
-- browser-saved `Wang - ...html` and `Wang - ..._files/` artifacts
+- Playwright 调试记录和截图
+- 浏览器另存网页产生的 `Wang - ...html` 和 `Wang - ..._files/`
 
-This keeps the GitHub repository clean while preserving the files needed to install and run the local project again.
+这样可以保证 GitHub 仓库干净，同时保留重新安装和运行项目所需的文件。
