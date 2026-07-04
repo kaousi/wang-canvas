@@ -1,0 +1,19 @@
+{
+  "port": 3456,
+  "apiBaseUrl": "",
+  "apiKey": "",
+  "model": "",
+  "authToken": "",
+  "openaiProfiles": [
+    {
+      "id": "default",
+      "name": "Default",
+      "baseUrl": "",
+      "apiKey": "",
+      "model": "gpt-image-2"
+    }
+  ],
+  "activeOpenaiProfileId": "default",
+  "openaiStreamingEnabled": true,
+  "outputFormat": "png"
+}

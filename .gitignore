@@ -1,0 +1,31 @@
+# macOS and editor noise
+.DS_Store
+*.swp
+*.swo
+
+# Local automation artifacts
+.playwright-mcp/
+.vite/
+.venv/
+page-screenshot.png
+page-snapshot.md
+page-text.txt
+Wang - 漫剧制作 _ 无限画布 _ AI图像创作 _ AI视频生成 _ 智能创意平台.html
+Wang - 漫剧制作 _ 无限画布 _ AI图像创作 _ AI视频生成 _ 智能创意平台_files/
+
+# Dependencies and temporary files
+node_modules/
+wang-local/node_modules/
+wang-local/tmp/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Local runtime state and generated media
+wang-local/generated/
+wang-local/config.json
+
+# Environment and secret files
+.env
+.env.*
+!.env.example
