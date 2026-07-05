@@ -825,7 +825,7 @@ function sanitizeJsonBodyImages(req, _res, next) {
 const localStorePath = path.join(imgDir, 'local-sessions.json')
 
 function emptyLocalStore() {
-  return { sessions: {}, canvases: {}, imageRecords: {}, generationRecords: [], assetRecords: [], sceneTemplateRecords: [] }
+  return { sessions: {}, canvases: {}, imageRecords: {}, generationRecords: [], assetRecords: [], sceneTemplateRecords: [], deletedRecordIds: [] }
 }
 
 function loadLocalStore() {
@@ -841,6 +841,7 @@ function loadLocalStore() {
       generationRecords: Array.isArray(parsed.generationRecords) ? parsed.generationRecords : [],
       assetRecords: Array.isArray(parsed.assetRecords) ? parsed.assetRecords : [],
       sceneTemplateRecords: Array.isArray(parsed.sceneTemplateRecords) ? parsed.sceneTemplateRecords : [],
+      deletedRecordIds: Array.isArray(parsed.deletedRecordIds) ? parsed.deletedRecordIds : [],
     }
   } catch (err) {
     console.warn('[local-store] failed to load:', err.message)
@@ -1357,6 +1358,27 @@ function ensureAssetRecords() {
   return localStore.assetRecords
 }
 
+function ensureDeletedRecordIds() {
+  if (!Array.isArray(localStore.deletedRecordIds)) localStore.deletedRecordIds = []
+  return localStore.deletedRecordIds
+}
+
+function compactRecordId(value) {
+  return String(value || '').trim()
+}
+
+function rememberDeletedRecordIds(ids = []) {
+  const cleanIds = (Array.isArray(ids) ? ids : [ids]).map(compactRecordId).filter(Boolean)
+  if (cleanIds.length === 0) return
+  const merged = new Set([...ensureDeletedRecordIds(), ...cleanIds])
+  localStore.deletedRecordIds = Array.from(merged).slice(-5000)
+}
+
+function localRecordWasDeleted(...ids) {
+  const deletedIds = new Set(ensureDeletedRecordIds().map(compactRecordId).filter(Boolean))
+  return ids.map(compactRecordId).filter(Boolean).some(id => deletedIds.has(id))
+}
+
 const LOCAL_LIST_DEFAULT_PAGE_SIZE = 24
 const LOCAL_LIST_MAX_PAGE_SIZE = 60
 const LOCAL_LIST_THUMB_SIZE = 320
@@ -1649,6 +1671,7 @@ function assetRecordView(record = {}) {
 function upsertGenerationRecord(record = {}) {
   const rows = ensureGenerationRecords()
   const view = generationRecordView(record)
+  if (localRecordWasDeleted(view.id, view.taskId, view.taskId ? `generation_${view.taskId}` : '', record.generationId)) return null
   const index = rows.findIndex(item => item.id === view.id || (view.taskId && item.taskId === view.taskId))
   if (index >= 0) rows[index] = generationRecordView({ ...rows[index], ...view, updateTime: view.updateTime || nowIso() })
   else rows.unshift(view)
@@ -1663,6 +1686,7 @@ function upsertAssetRecord(record = {}) {
   const rows = ensureAssetRecords()
   const view = assetRecordView(record)
   if (!view.url && !view.textContent) return null
+  if (localRecordWasDeleted(view.id, view.assetId, view.materialId, view.generationId, view.taskId, view.taskId ? `generation_${view.taskId}` : '')) return null
   const index = rows.findIndex(item => item.id === view.id || item.assetId === view.assetId || (view.taskId && item.taskId === view.taskId && item.url === view.url) || (view.url && item.url === view.url))
   if (index >= 0) rows[index] = assetRecordView({ ...rows[index], ...view, updateTime: view.updateTime || nowIso() })
   else rows.unshift(view)
@@ -1789,7 +1813,7 @@ function recordGenerationFinal(taskId) {
     createTime: existing.createTime || isoFromTime(task.createdAt),
     updateTime: nowIso(),
   })
-  if (record.status === 'SUCCESS') recordAssetsForGeneration(record)
+  if (record?.status === 'SUCCESS') recordAssetsForGeneration(record)
   persistLocalStore()
   return record
 }
@@ -1883,7 +1907,7 @@ function hydrateLocalRecordsFromSessions({ force = false } = {}) {
         createTime: isoFromTime(data.createdAt || session.createTime),
         updateTime: session.updateTime || nowIso(),
       })
-      if (record.status === 'SUCCESS') recordAssetsForGeneration(record)
+      if (record?.status === 'SUCCESS') recordAssetsForGeneration(record)
       changed = true
     })
   })
@@ -1946,6 +1970,85 @@ function listLocalAssetRecords(query = {}) {
     pageSize,
     totalPages: Math.max(1, Math.ceil(rows.length / pageSize)),
   }
+}
+
+function assetRecordIds(record = {}) {
+  return [
+    record.id,
+    record.assetId,
+    record.materialId,
+  ].map(compactRecordId).filter(Boolean)
+}
+
+function generationRecordIds(record = {}) {
+  const taskId = compactRecordId(record.taskId)
+  return [
+    record.id,
+    record.generationId,
+    taskId,
+    taskId ? `generation_${taskId}` : '',
+  ].map(compactRecordId).filter(Boolean)
+}
+
+function deleteLocalGenerationRecords(ids = []) {
+  const idSet = new Set((Array.isArray(ids) ? ids : [ids]).map(compactRecordId).filter(Boolean))
+  if (idSet.size === 0) return { deletedCount: 0, deletedIds: [] }
+
+  const rows = ensureGenerationRecords().map(generationRecordView)
+  const deletedRows = []
+  const keptRows = rows.filter(row => {
+    const matched = generationRecordIds(row).some(id => idSet.has(id))
+    if (matched) deletedRows.push(row)
+    return !matched
+  })
+
+  const deletedGenerationIds = new Set()
+  deletedRows.forEach(row => generationRecordIds(row).forEach(id => deletedGenerationIds.add(id)))
+
+  localStore.generationRecords = keptRows
+  localStore.assetRecords = ensureAssetRecords().filter(row => {
+    const matched = generationRecordIds(row).some(id => deletedGenerationIds.has(id))
+    if (matched) assetRecordIds(row).forEach(id => deletedGenerationIds.add(id))
+    return !matched
+  })
+  const deletedIds = new Set([...idSet, ...deletedGenerationIds])
+  rememberDeletedRecordIds(Array.from(deletedIds))
+  return { deletedCount: deletedRows.length, deletedIds: Array.from(deletedIds) }
+}
+
+function deleteLocalAssetRecords(ids = []) {
+  const idSet = new Set((Array.isArray(ids) ? ids : [ids]).map(compactRecordId).filter(Boolean))
+  if (idSet.size === 0) return { deletedCount: 0, deletedIds: [] }
+
+  const rows = ensureAssetRecords().map(assetRecordView)
+  const deletedRows = []
+  const keptRows = rows.filter(row => {
+    const matched = assetRecordIds(row).some(id => idSet.has(id))
+    if (matched) deletedRows.push(row)
+    return !matched
+  })
+
+  const deletedIds = new Set(idSet)
+  deletedRows.forEach(row => assetRecordIds(row).forEach(id => deletedIds.add(id)))
+  localStore.assetRecords = keptRows
+
+  const remainingGenerationKeys = new Set()
+  keptRows.forEach(row => generationRecordIds(row).forEach(id => remainingGenerationKeys.add(id)))
+  const generationIdsToDelete = new Set()
+  deletedRows.forEach(row => {
+    const keys = generationRecordIds(row)
+    if (keys.length > 0 && !keys.some(id => remainingGenerationKeys.has(id))) {
+      keys.forEach(id => generationIdsToDelete.add(id))
+    }
+  })
+  if (generationIdsToDelete.size > 0) {
+    generationIdsToDelete.forEach(id => deletedIds.add(id))
+    const result = deleteLocalGenerationRecords(Array.from(generationIdsToDelete))
+    result.deletedIds.forEach(id => deletedIds.add(id))
+  }
+
+  rememberDeletedRecordIds(Array.from(deletedIds))
+  return { deletedCount: deletedRows.length, deletedIds: Array.from(deletedIds) }
 }
 
 function findLocalAssetRef(taskId) {
@@ -2504,11 +2607,15 @@ app.get(/^\/assets\/WorkflowCanvas-.*\.js$/, (req, res, next) => {
     ],
     [
       'const ue=(Array.isArray(B.urls)?B.urls:B.url?[B.url]:[]).filter(Boolean),q=ue[0]||"";',
-      'const ue=(Array.isArray(B.urls)?B.urls:B.url?[B.url]:[]).filter(Boolean),q=ue[0]||"",Ze=(Array.isArray(B.originalUrls)?B.originalUrls:B.originalUrl?[B.originalUrl]:B.fullUrl?[B.fullUrl]:B.originalImageUrl?[B.originalImageUrl]:[]).filter(Boolean),ft=Ze[0]||q;',
+      'const ue=(Array.isArray(B.urls)?B.urls:B.url?[B.url]:[]).filter(Boolean),q=ue[0]||"",Ot=(Array.isArray(B.originalUrls)?B.originalUrls:B.originalUrl?[B.originalUrl]:B.fullUrl?[B.fullUrl]:B.originalImageUrl?[B.originalImageUrl]:[]).filter(Boolean),qt=Ot[0]||q;',
     ],
     [
       'return{id:`hist-${le}-${se}-${Date.now()}`,name:J(De),urls:ue,url:le==="world"?De:q,coverUrl:De,type:le,createTime:B.createTime,_raw:B}})',
-      'return{id:`hist-${le}-${se}-${Date.now()}`,name:J(ft),urls:ue,fullUrls:Ze,originalUrl:ft,previewUrl:ft,url:le==="world"?De:q,coverUrl:De,type:le,createTime:B.createTime,_raw:B}})',
+      'return{id:`hist-${le}-${se}-${Date.now()}`,name:J(qt),urls:ue,fullUrls:Ot,originalUrl:qt,previewUrl:qt,url:le==="world"?De:q,coverUrl:De,type:le,createTime:B.createTime,_raw:B}})',
+    ],
+    [
+      'return{id:String(Ze),recordId:String(Ze),name:J(De),urls:ue,url:le==="world"?De:q,coverUrl:De,type:le,createTime:B.createTime,_raw:B}})',
+      'return{id:String(Ze),recordId:String(Ze),name:J(qt),urls:ue,fullUrls:Ot,originalUrl:qt,previewUrl:qt,url:le==="world"?De:q,coverUrl:De,type:le,createTime:B.createTime,_raw:B}})',
     ],
     [
       'u.value=X,d.value=X.url||X.urls&&X.urls[0]||"";',
@@ -2827,7 +2934,7 @@ app.post('/api/script-assets/generate', async (req, res) => {
 
 // ── Redirect unwanted SPA routes to workflow ──
 app.get(['/', '/neo-tv', '/home', '/inputSection'], (req, res) => {
-  res.redirect('/workflows')
+  res.redirect('/workflow?workspaceId=demo')
 })
 
 // ── Dynamic OpenAI config API (for settings UI) ──
@@ -2894,7 +3001,15 @@ app.use((req, res, next) => {
     '/agent/story-canvas/latest-generation',
     '/agent/story-canvas/pose-reference',
     '/agent/story-canvas/convert-angle',
+    '/agent/story-canvas/query-assets-v2',
+    '/agent/story-canvas/query-user-assets',
+    '/agent/story-canvas/query-asset-ref',
+    '/agent/story-canvas/add-canvas-asset',
+    '/agent/story-canvas/update-canvas-asset',
+    '/agent/story-canvas/delete-canvas-asset',
     '/agent/story-cleaning/text-model-configs',
+    '/agent/ai-image-generation/page',
+    '/agent/ai-image-generation/batch-delete',
   ])
   if (p.startsWith('/assets/') || p === '/auth-mock.js') return next()
   if (p.startsWith('/local/') || p.startsWith('/generated/') || p.startsWith('/dify/')) return next()
@@ -3016,10 +3131,9 @@ app.use((req, res, next) => {
     res.json(mockSuccess(records.length === 1 ? records[0] : records))
   })
   app.delete('/agent/canvas/material/:id', (req, res) => {
-    const id = String(req.params.id || '')
-    localStore.assetRecords = ensureAssetRecords().filter(item => String(item.assetId || item.materialId || item.id || '') !== id)
+    const result = deleteLocalAssetRecords(req.params.id)
     persistLocalStore()
-    res.json(mockSuccess())
+    res.json(mockSuccess(result))
   })
   app.post('/agent/canvas/material/page', (req, res) => {
     const page = listLocalAssetRecords(req.body || {})
@@ -3058,7 +3172,18 @@ app.use((req, res, next) => {
       totalPages: page.totalPages,
     }))
   })
-  app.delete('/agent/ai-image-generation/:id', (req, res) => res.json(mockSuccess()))
+  app.delete('/agent/ai-image-generation/:id', (req, res) => {
+    const result = deleteLocalGenerationRecords(req.params.id)
+    persistLocalStore()
+    res.json(mockSuccess(result))
+  })
+  app.post('/agent/ai-image-generation/batch-delete', (req, res) => {
+    const ids = Array.isArray(req.body?.ids) ? req.body.ids : Array.isArray(req.body?.recordIds) ? req.body.recordIds : []
+    if (ids.length === 0) return res.json(mockFail('ids is required'))
+    const result = deleteLocalGenerationRecords(ids)
+    persistLocalStore()
+    res.json(mockSuccess(result))
+  })
   app.get('/agent/ai-image-template/page', (req, res) => res.json(mockSuccess({ list: [], total: 0 })))
   app.post('/agent/ai-image/upload', (req, res) => res.json(mockSuccess()))
 
@@ -3547,12 +3672,11 @@ app.use((req, res, next) => {
   })
   app.post('/agent/story-canvas/delete-canvas-asset', (req, res) => {
     const body = req.body || {}
-    const ids = (Array.isArray(body.assetIds) ? body.assetIds : [body.assetId || body.materialId || body.id]).map(item => String(item || '')).filter(Boolean)
+    const ids = (Array.isArray(body.assetIds) ? body.assetIds : Array.isArray(body.ids) ? body.ids : [body.assetId || body.materialId || body.id]).map(item => String(item || '')).filter(Boolean)
     if (ids.length === 0) return res.json(mockFail('assetId is required'))
-    const idSet = new Set(ids)
-    localStore.assetRecords = ensureAssetRecords().filter(item => !idSet.has(String(item.assetId || item.materialId || item.id || '')))
+    const result = deleteLocalAssetRecords(ids)
     persistLocalStore()
-    res.json(mockSuccess({ deletedCount: ids.length }))
+    res.json(mockSuccess(result))
   })
   app.get('/agent/story-canvas/query-asset-ref', (req, res) => res.json(mockSuccess(findLocalAssetRef(req.query?.taskId))))
   app.post('/agent/story-canvas/query-asset-ref', (req, res) => res.json(mockSuccess(findLocalAssetRef(req.body?.taskId))))

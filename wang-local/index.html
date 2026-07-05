@@ -128,7 +128,7 @@
   <script>
     // 删除主页/WowTV/超创站的导航标签，并拦截路由
     const blocked = ['/', '/neo-tv', '/home', '/inputSection']
-    const redirectTo = '/workflows'
+    const redirectTo = '/workflow?workspaceId=demo'
     function removeTabs() {
       document.querySelectorAll('.main-tab-label').forEach(el => {
         if (['主页', 'WowTV', '超创站', '工具集'].includes(el.textContent?.trim())) {
