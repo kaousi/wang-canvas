@@ -2,6 +2,70 @@
   const dataImageCache = new Map()
   const DATA_IMAGE_PREFIX = 'data:image/'
   const nativeFetch = window.fetch ? window.fetch.bind(window) : null
+  const MAX_LOCAL_UPLOAD_REQUESTS = 4
+  let localUploadActiveCount = 0
+  const localUploadQueue = []
+
+  function isLocalUploadUrl(value) {
+    const raw = String(value || '')
+    if (!raw) return false
+    try {
+      return new URL(raw, window.location.href).pathname.startsWith('/dify/')
+    } catch {
+      return raw.startsWith('/dify/') || raw.includes('/dify/')
+    }
+  }
+
+  function enqueueLocalUpload(task) {
+    return new Promise((resolve, reject) => {
+      const run = () => {
+        localUploadActiveCount += 1
+        Promise.resolve()
+          .then(task)
+          .then(resolve, reject)
+          .finally(() => {
+            localUploadActiveCount = Math.max(0, localUploadActiveCount - 1)
+            const next = localUploadQueue.shift()
+            if (next) next()
+          })
+      }
+      if (localUploadActiveCount < MAX_LOCAL_UPLOAD_REQUESTS) run()
+      else localUploadQueue.push(run)
+    })
+  }
+
+  function sendWithLocalUploadQueue(xhr, body, sender) {
+    const url = xhr.__wangUrl || ''
+    if (!isLocalUploadUrl(url)) return sender(body)
+    enqueueLocalUpload(() => new Promise((resolve, reject) => {
+      let settled = false
+      const cleanup = () => {
+        xhr.removeEventListener('loadend', release)
+        xhr.removeEventListener('error', release)
+        xhr.removeEventListener('abort', release)
+        xhr.removeEventListener('timeout', release)
+      }
+      const release = () => {
+        if (settled) return
+        settled = true
+        cleanup()
+        resolve()
+      }
+      xhr.addEventListener('loadend', release)
+      xhr.addEventListener('error', release)
+      xhr.addEventListener('abort', release)
+      xhr.addEventListener('timeout', release)
+      try {
+        sender(body)
+      } catch (err) {
+        cleanup()
+        reject(err)
+      }
+    })).catch(err => {
+      console.warn('[Upload] local queue send failed:', err?.message || err)
+    })
+    return undefined
+  }
 
   function hasDataImage(value, seen = new WeakSet()) {
     if (typeof value === 'string') return value.startsWith(DATA_IMAGE_PREFIX) && value.includes(';base64,')
@@ -88,8 +152,9 @@
     if (typeof originalFetch === 'function') {
       window.fetch = async function patchedFetch(input, init) {
         const requestUrl = requestUrlOf(input)
+        const runFetch = () => originalFetch.call(this, input, init)
         if (shouldSkipCleanup(requestUrl)) {
-          return originalFetch.call(this, input, init)
+          return isLocalUploadUrl(requestUrl) ? enqueueLocalUpload(runFetch) : runFetch()
         }
         const initContentType = init?.headers instanceof Headers
           ? init.headers.get('content-type')
@@ -106,7 +171,7 @@
             }
           }
         }
-        return originalFetch.call(this, input, init)
+        return isLocalUploadUrl(requestUrl) ? enqueueLocalUpload(runFetch) : runFetch()
       }
     }
 
@@ -125,14 +190,18 @@
       return originalSetRequestHeader.apply(this, arguments)
     }
     XMLHttpRequest.prototype.send = function patchedSend(body) {
-      if (this.__wangSkipDataUrlCleanup) return originalSend.call(this, body)
+      if (this.__wangSkipDataUrlCleanup) {
+        return sendWithLocalUploadQueue(this, body, finalBody => originalSend.call(this, finalBody))
+      }
       const url = this.__wangUrl || ''
       const contentType = this.__wangHeaders?.['content-type'] || ''
       if (!shouldSkipCleanup(url) && isJsonContentType(contentType) && typeof body === 'string' && body.includes(DATA_IMAGE_PREFIX)) {
-        cleanJsonBody(body).then(cleanBody => originalSend.call(this, cleanBody))
+        cleanJsonBody(body).then(cleanBody => {
+          sendWithLocalUploadQueue(this, cleanBody, finalBody => originalSend.call(this, finalBody))
+        })
         return
       }
-      return originalSend.call(this, body)
+      return sendWithLocalUploadQueue(this, body, finalBody => originalSend.call(this, finalBody))
     }
   }
 

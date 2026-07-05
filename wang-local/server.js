@@ -10,7 +10,16 @@ const multer = require('multer')
 const { spawn } = require('child_process')
 const { EventEmitter } = require('events')
 
-const upload = multer({ dest: path.join(__dirname, 'tmp') })
+const uploadTmpDir = path.join(__dirname, 'tmp')
+if (!fs.existsSync(uploadTmpDir)) fs.mkdirSync(uploadTmpDir, { recursive: true })
+const upload = multer({
+  dest: uploadTmpDir,
+  limits: {
+    fileSize: 1024 * 1024 * 1024,
+    files: 128,
+    fields: 128,
+  },
+})
 
 // ── Load config ──
 const configPath = path.join(__dirname, 'config.json')
@@ -49,8 +58,16 @@ let OPENAI_STREAMING_ENABLED = normalizeOpenAIStreamingEnabled(config)
 refreshActiveOpenAIGlobals()
 
 const app = express()
-app.use(express.json({ limit: '50mb' }))
-app.use(express.text())
+app.use(express.json({ limit: '200mb' }))
+app.use(express.urlencoded({ limit: '200mb', extended: true }))
+app.use(express.text({ limit: '200mb' }))
+app.use((err, _req, res, next) => {
+  if (!err) return next()
+  const message = err.type === 'entity.too.large'
+    ? '上传内容过大，请减少单次上传数量或压缩文件后重试'
+    : err.message || '请求解析失败'
+  return res.status(200).json({ success: false, message, errMessage: message })
+})
 
 const imgDir = path.join(__dirname, 'generated')
 const thumbsDir = path.join(imgDir, '.thumbs')
@@ -80,6 +97,32 @@ function mockSuccess(data = {}) {
 
 function mockFail(msg = 'error') {
   return { success: false, message: msg }
+}
+
+function uploadSuccessPayload(fileUrl, asset = null) {
+  return {
+    success: true,
+    url: fileUrl,
+    fileUrl,
+    imageUrl: fileUrl,
+    asset,
+    data: {
+      url: fileUrl,
+      fileUrl,
+      imageUrl: fileUrl,
+      asset,
+    },
+  }
+}
+
+function uploadSingleFile(req, res, next) {
+  upload.single('file')(req, res, err => {
+    if (!err) return next()
+    const message = err.code === 'LIMIT_FILE_SIZE'
+      ? '文件过大，无法上传'
+      : err.message || '上传失败'
+    return res.status(200).json(mockFail(message))
+  })
 }
 
 function mockRemoved(msg = '该模块已移除') {
@@ -1942,7 +1985,7 @@ app.use((req, res, next) => {
     res.sendStatus(200)
   })
 
-  app.post('/agent/upload-local', upload.single('file'), (req, res) => {
+  app.post('/agent/upload-local', uploadSingleFile, (req, res) => {
     try {
       const file = req.file
       if (!file) return res.json(mockFail('no file'))
@@ -1968,7 +2011,7 @@ app.use((req, res, next) => {
         updateTime: nowIso(),
       })
       persistLocalStore()
-      res.json(mockSuccess({ url: fileUrl, asset: record }))
+      res.json(uploadSuccessPayload(fileUrl, record))
     } catch (e) {
       res.json(mockFail(e.message))
     }
@@ -1994,7 +2037,7 @@ app.use((req, res, next) => {
         updateTime: nowIso(),
       })
       persistLocalStore()
-      res.json(mockSuccess({ url, asset: record }))
+      res.json(uploadSuccessPayload(url, record))
     } catch (e) {
       res.json(mockFail(e.message))
     }
