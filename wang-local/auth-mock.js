@@ -5,7 +5,8 @@
   const MAX_LOCAL_UPLOAD_REQUESTS = 4
   let localUploadActiveCount = 0
   const localUploadQueue = []
-  const IMAGE_PROMPT_PRESET_STORAGE_KEY = 'wang_image_prompt_preset'
+  const IMAGE_PROMPT_PRESET_STORAGE_KEY = 'wang_image_node_prompt_preset'
+  const LEGACY_IMAGE_PROMPT_PRESET_STORAGE_KEY = 'wang_image_prompt_preset'
   const IMAGE_PROMPT_PRESET_UNLOCK_TEXT = '\u2060'
   const IMAGE_PROMPT_PRESET_UNLOCK_RE = /[\u200B\u2060]/g
   const IMAGE_PROMPT_PRESETS = {
@@ -32,7 +33,9 @@
 
   function selectedImagePromptPresetId() {
     try {
-      return localStorage.getItem(IMAGE_PROMPT_PRESET_STORAGE_KEY) || ''
+      return localStorage.getItem(IMAGE_PROMPT_PRESET_STORAGE_KEY) ||
+        localStorage.getItem(LEGACY_IMAGE_PROMPT_PRESET_STORAGE_KEY) ||
+        ''
     } catch {
       return ''
     }
@@ -44,6 +47,7 @@
     try {
       if (nextValue) localStorage.setItem(IMAGE_PROMPT_PRESET_STORAGE_KEY, nextValue)
       else localStorage.removeItem(IMAGE_PROMPT_PRESET_STORAGE_KEY)
+      localStorage.removeItem(LEGACY_IMAGE_PROMPT_PRESET_STORAGE_KEY)
     } catch {
       /* ignore */
     }
@@ -315,13 +319,6 @@
         margin: 6px 0 8px;
         background: rgba(255, 255, 255, 0.03);
       }
-      .wang-image-prompt-preset--floating {
-        position: fixed;
-        left: 16px;
-        bottom: 16px;
-        z-index: 10020;
-        box-shadow: 0 8px 32px rgba(0, 0, 0, 0.42), inset 0 1px 0 rgba(255, 255, 255, 0.04);
-      }
       .wang-image-prompt-preset__label {
         flex: 0 0 auto;
         padding: 0 4px 0 6px;
@@ -363,12 +360,6 @@
         box-shadow: 0 0 12px rgba(99, 102, 241, 0.16), inset 0 1px 0 rgba(255, 255, 255, 0.02);
       }
       @media (max-width: 720px) {
-        .wang-image-prompt-preset--floating {
-          left: 10px;
-          right: 10px;
-          bottom: 10px;
-          justify-content: space-between;
-        }
         .wang-image-prompt-preset__option {
           min-width: 36px;
           padding: 0 8px;
@@ -479,6 +470,11 @@
     return isPromptInput(field) && !!findImageGenerationPanel(field)
   }
 
+  function isImageGenerationPanelText(text) {
+    if (!text) return false
+    return /图片生成|图像生成|生成图片|AI图像|图片节点/i.test(text)
+  }
+
   function applyImagePromptPresetUnlockToPromptFields(root = document) {
     if (!root.querySelectorAll && !root.matches) return
     const selectedPreset = getImagePromptPreset(selectedImagePromptPresetId())
@@ -508,16 +504,16 @@
     let current = el
     for (let depth = 0; current && current !== document.body && depth < 16; depth += 1) {
       const text = compactUiText(current)
+      if (current.classList?.contains('vue-flow__node')) {
+        return isImageGenerationPanelText(text) ? current : null
+      }
       if (
         text.length > 0 &&
         text.length < 12000 &&
-        /图片生成|图像生成|生成图片|AI图像/i.test(text) &&
+        isImageGenerationPanelText(text) &&
         /提示词|prompt|描述|画面|内容|生成/i.test(text)
       ) {
         return current
-      }
-      if (current.classList?.contains('vue-flow__node')) {
-        return /图片生成|图像生成|生成图片|AI图像/i.test(text) ? current : null
       }
       current = current.parentElement
     }
@@ -590,19 +586,6 @@
     })
   }
 
-  function workflowPageHasCanvas() {
-    return /\/workflow|\/workflows/.test(window.location.pathname)
-  }
-
-  function ensureFloatingImagePromptPresetControl() {
-    if (!workflowPageHasCanvas() || !document.body) return
-    if (document.querySelector('[data-wang-image-prompt-preset-floating="true"]')) return
-    ensureImagePromptPresetStyles()
-    const control = createImagePromptPresetControl('floating')
-    control.dataset.wangImagePromptPresetFloating = 'true'
-    document.body.appendChild(control)
-  }
-
   function installImagePromptPresetUi() {
     window.__wangImagePromptPresets = {
       presets: IMAGE_PROMPT_PRESETS,
@@ -612,7 +595,6 @@
     }
     const start = () => {
       if (!document.body) return
-      ensureFloatingImagePromptPresetControl()
       injectInlineImagePromptPresetControls(document)
       applyImagePromptPresetUnlockToPromptFields(document)
       unlockImagePromptPresetGenerateButtons(document)
@@ -630,7 +612,7 @@
         setSelectedImagePromptPresetId(button.dataset.wangImagePresetOption || '')
       }, true)
       window.addEventListener('storage', event => {
-        if (event.key === IMAGE_PROMPT_PRESET_STORAGE_KEY) {
+        if (event.key === IMAGE_PROMPT_PRESET_STORAGE_KEY || event.key === LEGACY_IMAGE_PROMPT_PRESET_STORAGE_KEY) {
           updateImagePromptPresetControls()
           applyImagePromptPresetUnlockToPromptFields(document)
           unlockImagePromptPresetGenerateButtons(document)
@@ -650,7 +632,6 @@
         scheduled = true
         requestAnimationFrame(() => {
           scheduled = false
-          ensureFloatingImagePromptPresetControl()
           if (pendingRoots.size === 0) injectInlineImagePromptPresetControls(document)
           else {
             const roots = Array.from(pendingRoots)
