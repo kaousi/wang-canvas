@@ -7,8 +7,13 @@ const url = require('url')
 const crypto = require('crypto')
 const zlib = require('zlib')
 const multer = require('multer')
-const { spawn } = require('child_process')
 const { EventEmitter } = require('events')
+let sharp = null
+try {
+  sharp = require('sharp')
+} catch {
+  sharp = null
+}
 
 const uploadTmpDir = path.join(__dirname, 'tmp')
 if (!fs.existsSync(uploadTmpDir)) fs.mkdirSync(uploadTmpDir, { recursive: true })
@@ -118,11 +123,15 @@ function mockFail(msg = 'error') {
   return { success: false, message: msg }
 }
 
+const CHARACTER_THREE_VIEW_PROMPT_PREFIX = '生成全身三视图以及一张正面面部特写(最左边占满三分之一的位置是超大面部正面特写，面部特写为黑白素描风格，一定要是素描风格)，右边三分之二放正视图，侧视图，后视图（右侧的三视图脸部打码，打码是一个白色的正方形色块），无背景，头发没有任何装饰物品，'
+const CHARACTER_3D_STYLE_PROMPT_SUFFIX = '。平滑细腻的 3D 陶瓷质感肌肤，增加颗粒法线贴图以体现写实感。材质带有真实的污渍与磨损细节。次世代 3D 游戏风格，融合《灵笼》地面平民质感设定稿，虚幻引擎 5 (Unreal Engine 5) 风格化渲染，次表面散射，高精度法线贴图，3D 几何倒角，纯色中性灰背景。'
+
 const IMAGE_PROMPT_PRESETS = {
   character_three_view: {
     id: 'character_three_view',
     label: '人物三视图',
-    prompt: '生成全身三视图以及一张正面面部特写(最左边占满三分之一的位置是超大面部正面特写，面部特写为黑白素描风格，一定要是素描风格)，右边三分之二放正视图，侧视图，后视图（右侧的三视图脸部打码，打码是一个白色的正方形色块），无背景，头发没有任何装饰物品，',
+    prompt: CHARACTER_THREE_VIEW_PROMPT_PREFIX,
+    suffix: CHARACTER_3D_STYLE_PROMPT_SUFFIX,
   },
 }
 
@@ -145,11 +154,22 @@ function applyImagePromptPreset(prompt, presetId) {
   const cleanPrompt = String(prompt || '').replace(/[\u200B\u2060]/g, '').trim()
   const preset = getImagePromptPreset(presetId)
   if (!preset) return { prompt: cleanPrompt, presetId: '', presetLabel: '' }
-  if (cleanPrompt.startsWith(preset.prompt)) {
+  const prefix = preset.prompt || ''
+  const suffix = preset.suffix || ''
+  if (cleanPrompt.startsWith(prefix) && (!suffix || cleanPrompt.includes(suffix.trim()))) {
     return { prompt: cleanPrompt, presetId: preset.id, presetLabel: preset.label }
   }
+  if (suffix) {
+    const body = cleanPrompt.startsWith(prefix) ? cleanPrompt.slice(prefix.length).trim() : cleanPrompt
+    const normalizedPrefix = body ? prefix : prefix.replace(/[，,]\s*$/, '')
+    return {
+      prompt: `${normalizedPrefix}${body}${suffix}`,
+      presetId: preset.id,
+      presetLabel: preset.label,
+    }
+  }
   return {
-    prompt: `${preset.prompt}${cleanPrompt}`,
+    prompt: `${prefix}${cleanPrompt}`,
     presetId: preset.id,
     presetLabel: preset.label,
   }
@@ -175,7 +195,8 @@ function scriptAssetPromptSystemText() {
   }
 }
 
-function parseScriptAssetPromptOutput(content = '') {
+function parseScriptAssetPromptOutput(content = '', renderMode = '') {
+  const normalizedRenderMode = normalizeScriptAssetRenderMode(renderMode)
   const sectionMap = {
     人物: 'character',
     物品: 'prop',
@@ -196,8 +217,8 @@ function parseScriptAssetPromptOutput(content = '') {
     if (!match) return
     const categoryLabel = match[1]
     const category = sectionMap[categoryLabel] || sectionMap[currentSection] || 'asset'
-    const name = match[2].trim()
-    const prompt = line
+    const name = scriptAssetDisplayName(match[2].trim(), `资产${items.length + 1}`)
+    const prompt = normalizeScriptAssetPromptForRenderMode(line, normalizedRenderMode, category)
     items.push({
       id: `script_asset_item_${shortHash(prompt)}_${items.length + 1}`,
       category,
@@ -216,30 +237,95 @@ function normalizeScriptAssetRenderMode(value = '') {
   return '插画'
 }
 
+function scriptAssetRenderModeDirective(renderMode) {
+  if (renderMode !== '3D') return ''
+  return [
+    '【渲染模式强制约束】',
+    '渲染模式为 3D。本次全部资产提示词必须表达为三维资产模型、CG渲染、PBR材质、模型布线感、材质球与三维灯光。',
+    '题材档案中的"写实""摄影感""胶片感"只能转换为"写实质感的3D模型材质与CG灯光"，不得输出真人、摄影、照片、实拍、写实人像、演员、镜头拍摄等词。',
+    '最终每条资产提示词中不得出现"真人""摄影""照片""实拍""写实人像"等词。',
+  ].join('\n')
+}
+
+function normalizeScriptAssetPromptForRenderMode(prompt = '', renderMode = '', category = '') {
+  const normalizedRenderMode = normalizeScriptAssetRenderMode(renderMode)
+  let text = String(prompt || '').trim()
+  if (normalizedRenderMode !== '3D' || !text) return text
+
+  text = text
+    .replace(/（三视图以3D基底呈现：插画为绘画风、3D为三维建模渲染、真人为写实人像；右侧/g, '（三视图以3D基底呈现：三维建模渲染、CG角色模型、PBR材质；右侧')
+    .replace(/三视图以3D基底呈现：插画为绘画风、3D为三维建模渲染、真人为写实人像/g, '三视图以3D基底呈现：三维建模渲染、CG角色模型、PBR材质')
+    .replace(/；当3D为3D时[^；。]*[；。]/g, '；')
+    .replace(/；当3D为3D模型时[^；。]*[；。]/g, '；')
+    .replace(/当3D为3D时[^；。]*[；。]/g, '')
+    .replace(/当3D为3D模型时[^；。]*[；。]/g, '')
+    .replace(/写实现代摄影感/g, '写实现代CG资产渲染')
+    .replace(/现代摄影感/g, '现代CG资产渲染')
+    .replace(/写实摄影感/g, '写实CG资产渲染')
+    .replace(/略带做旧胶片感/g, '略带做旧CG材质质感')
+    .replace(/胶片感/g, 'CG材质质感')
+    .replace(/摄影感/g, 'CG渲染质感')
+    .replace(/写实人像/g, '3D角色模型')
+    .replace(/真人/g, '3D角色模型')
+    .replace(/照片级/g, '高质量CG')
+    .replace(/照片/g, 'CG渲染图')
+    .replace(/实拍/g, '三维渲染')
+    .replace(/摄影/g, 'CG灯光渲染')
+    .replace(/镜头拍摄/g, '三维镜头构图')
+    .replace(/演员/g, '角色模型')
+    .replace(/真实人物/g, '三维角色')
+
+  const has3DAssetLanguage = /3D|三维|CG|PBR|模型|材质球/.test(text)
+  if (!has3DAssetLanguage) {
+    text += ' 3D资产约束：三维资产模型渲染，CG灯光，PBR材质。'
+  } else if (category === 'character' && !/PBR|材质球|CG/.test(text)) {
+    text += ' 3D资产约束：CG角色模型，PBR材质，三维灯光。'
+  } else if ((category === 'prop' || category === 'scene') && !/PBR|材质球|CG/.test(text)) {
+    text += ' 3D资产约束：CG资产模型，PBR材质，三维灯光。'
+  }
+
+  if (category === 'character' && !text.includes('平滑细腻的 3D 陶瓷质感肌肤')) {
+    text = `${text.replace(/[。.\s]*$/, '')}${CHARACTER_3D_STYLE_PROMPT_SUFFIX}`
+  }
+
+  return text.replace(/\s+/g, ' ').trim()
+}
+
 function buildScriptAssetPromptInput(script, body = {}) {
   const renderMode = normalizeScriptAssetRenderMode(body.renderMode || body.styleMode || body.style || body.artStyle)
   const configLines = [
     `渲染模式: ${renderMode}`,
     '语言: 中文',
   ]
+  if (renderMode === '3D' && !body.genreStyle) {
+    configLines.push('风格: 题材一致的三维资产模型渲染')
+  }
   if (body.maxPerCategory) configLines.push(`每类上限: ${Math.max(parseInt(body.maxPerCategory) || 12, 1)}`)
   if (body.appearanceThreshold) configLines.push(`出现阈值: ${Math.max(parseInt(body.appearanceThreshold) || 2, 1)}`)
   if (body.itemBackground) configLines.push(`物品背景: ${String(body.itemBackground).trim()}`)
   if (body.genreStyle) configLines.push(`风格: ${String(body.genreStyle).trim()}`)
   if (body.period) configLines.push(`年代: ${String(body.period).trim()}`)
+  const renderModeDirective = scriptAssetRenderModeDirective(renderMode)
   return [
     '【配置】',
     configLines.join('\n'),
+    renderModeDirective ? `\n${renderModeDirective}` : '',
     '',
     '【正文】',
     script,
   ].join('\n')
 }
 
+function scriptAssetDisplayName(item = {}, fallback = '资产') {
+  const raw = typeof item === 'string' ? item : item?.name
+  const name = String(raw || '').trim()
+    .replace(/^(人物|物品|场景|资产)\s*[-—－:：]\s*/i, '')
+    .trim()
+  return name || fallback
+}
+
 function scriptAssetNodeLabel(item = {}) {
-  const prefix = item.categoryLabel || (item.category === 'character' ? '人物' : item.category === 'prop' ? '物品' : item.category === 'scene' ? '场景' : '资产')
-  const name = String(item.name || '').trim()
-  return name ? `${prefix}-${name}` : prefix
+  return scriptAssetDisplayName(item)
 }
 
 function scriptAssetNodeDimensions(aspectRatio = '16:9') {
@@ -269,6 +355,7 @@ function buildScriptAssetImageNode({ item, nodeId, task, session, sourceNodeId, 
   const resolution = normalizeImageSizeLabel(params.size || '2K')
   const dimensions = scriptAssetNodeDimensions(aspectRatio)
   const createdAt = Date.now()
+  const displayName = scriptAssetDisplayName(item, `资产${index + 1}`)
   return {
     id: nodeId,
     type: 'image',
@@ -282,7 +369,7 @@ function buildScriptAssetImageNode({ item, nodeId, task, session, sourceNodeId, 
       negativePrompt: '',
       inputImageUrls: [],
       result: null,
-      label: scriptAssetNodeLabel(item),
+      label: displayName,
       icon: 'image',
       type: 'generation',
       status: task?.taskId ? 'PENDING' : 'idle',
@@ -301,7 +388,7 @@ function buildScriptAssetImageNode({ item, nodeId, task, session, sourceNodeId, 
       generatingMessage: task?.taskId ? '图片生成中...' : '',
       source: 'script-asset-generator',
       assetCategory: item.category,
-      assetName: item.name,
+      assetName: displayName,
       sourceNodeId: sourceNodeId || '',
     },
   }
@@ -1007,9 +1094,10 @@ function taskDataTypeFromId(taskId) {
 function normalizeTaskResultData(resultData) {
   const items = Array.isArray(resultData) ? resultData : resultData ? [resultData] : []
   return items.map(item => {
-    if (typeof item === 'string') return item
+    if (typeof item === 'string') return originalUrlForImageAction(item) || item
     if (item && typeof item === 'object') {
-      return item.url || item.imageUrl || item.videoUrl || item.audioUrl || item.resultUrl || item.textContent || item.content || item.text || item.output_text || ''
+      const value = item.originalUrl || item.originalImageUrl || item.fullUrl || item.url || item.imageUrl || item.videoUrl || item.audioUrl || item.resultUrl || item.textContent || item.content || item.text || item.output_text || ''
+      return originalUrlForImageAction(value) || value
     }
     return ''
   }).filter(Boolean)
@@ -1207,8 +1295,129 @@ function ensureAssetRecords() {
   return localStore.assetRecords
 }
 
+const LOCAL_LIST_DEFAULT_PAGE_SIZE = 24
+const LOCAL_LIST_MAX_PAGE_SIZE = 60
+const LOCAL_LIST_THUMB_SIZE = 320
+let localRecordsHydrationSignature = ''
+
 function shortHash(value) {
   return crypto.createHash('sha1').update(String(value || '')).digest('hex').slice(0, 12)
+}
+
+function isImageLikeUrl(url = '') {
+  const original = originalUrlFromThumb(url)
+  if (original) return isImageLikeUrl(original)
+  const clean = String(url || '').split('?')[0].toLowerCase()
+  if (!clean) return false
+  if (clean.startsWith('data:image/')) return true
+  if (clean.startsWith('/generated/') || clean.startsWith('/dify/')) return true
+  return /\.(png|jpe?g|webp|gif|bmp|avif)$/i.test(clean)
+}
+
+function originalUrlFromThumb(value = '') {
+  const raw = String(value || '').trim()
+  if (!raw) return ''
+  try {
+    const parsed = new URL(raw, 'http://localhost')
+    if (parsed.pathname !== '/agent/image-thumb') return ''
+    return String(parsed.searchParams.get('url') || '').trim()
+  } catch {
+    return ''
+  }
+}
+
+function originalUrlForImageAction(value = '') {
+  const raw = String(value || '').trim()
+  return originalUrlFromThumb(raw) || raw
+}
+
+function localImagePathFromUrl(value = '') {
+  const raw = String(value || '').trim()
+  if (!raw) return raw
+  if (raw.startsWith('/generated/') || raw.startsWith('/dify/')) return raw
+  if (!/^https?:\/\//i.test(raw)) return raw
+  try {
+    const parsed = new URL(raw)
+    if (!['localhost', '127.0.0.1'].includes(parsed.hostname)) return raw
+    if (!parsed.pathname.startsWith('/generated/') && !parsed.pathname.startsWith('/dify/')) return raw
+    return `${parsed.pathname}${parsed.search}`
+  } catch {
+    return raw
+  }
+}
+
+function remoteCdnThumbnailUrl(url = '', size = LOCAL_LIST_THUMB_SIZE) {
+  const raw = String(url || '').trim()
+  if (!/^https?:\/\//i.test(raw)) return ''
+  try {
+    const parsed = new URL(raw)
+    const host = parsed.hostname.toLowerCase()
+    const supportsOssProcess =
+      host.endsWith('.aliyuncs.com') ||
+      /\.oss-[a-z0-9-]+\.aliyuncs\.com$/i.test(host)
+    if (!supportsOssProcess) return ''
+    const maxSize = Math.min(Math.max(parseInt(size) || LOCAL_LIST_THUMB_SIZE, 48), 1024)
+    return raw.includes('x-oss-process=') ? raw : `${raw}${raw.includes('?') ? '&' : '?'}x-oss-process=image/resize,m_lfit,w_${maxSize}`
+  } catch {
+    return ''
+  }
+}
+
+function thumbnailUrlForImage(url = '', size = LOCAL_LIST_THUMB_SIZE) {
+  const raw = localImagePathFromUrl(originalUrlForImageAction(url))
+  if (!isImageLikeUrl(raw)) return raw
+  const maxSize = Math.min(Math.max(parseInt(size) || LOCAL_LIST_THUMB_SIZE, 48), 1024)
+  if (raw.startsWith('/generated/') || raw.startsWith('/dify/')) {
+    return raw.includes('x-oss-process=') ? raw : `${raw}${raw.includes('?') ? '&' : '?'}x-oss-process=image/resize,m_lfit,w_${maxSize}`
+  }
+  if (/^https?:\/\//i.test(raw)) {
+    const cdnThumb = remoteCdnThumbnailUrl(raw, maxSize)
+    if (cdnThumb) return cdnThumb
+    return sharp ? `/agent/image-thumb?size=${maxSize}&url=${encodeURIComponent(raw)}` : raw
+  }
+  return raw
+}
+
+function withListThumbnailFields(item = {}) {
+  if (!item || typeof item !== 'object') return item
+  const copy = { ...item }
+  const originalUrl = originalUrlForImageAction(copy.originalUrl || copy.originalImageUrl || copy.fullUrl || copy.assetUrl || copy.imageUrl || copy.url || (Array.isArray(copy.urls) ? copy.urls[0] : '') || '')
+  const sourceUrls = (Array.isArray(copy.urls) && copy.urls.length > 0 ? copy.urls : [originalUrl])
+    .map(originalUrlForImageAction)
+    .filter(Boolean)
+  const thumbUrls = sourceUrls.map(url => thumbnailUrlForImage(url))
+  const thumbUrl = thumbUrls[0] || thumbnailUrlForImage(originalUrl)
+  if (!thumbUrl || thumbUrl === originalUrl) return copy
+  copy.originalUrl = copy.originalUrl || originalUrl
+  copy.originalImageUrl = copy.originalImageUrl || originalUrl
+  copy.fullUrl = copy.fullUrl || originalUrl
+  copy.originalUrls = Array.isArray(copy.originalUrls) && copy.originalUrls.length > 0 ? copy.originalUrls : sourceUrls
+  copy.fullUrls = Array.isArray(copy.fullUrls) && copy.fullUrls.length > 0 ? copy.fullUrls : sourceUrls
+  copy.assetUrl = copy.assetUrl ? thumbUrl : copy.assetUrl
+  copy.imageUrl = copy.imageUrl ? thumbUrl : copy.imageUrl
+  copy.url = copy.url ? thumbUrl : copy.url
+  if (Array.isArray(copy.urls) && copy.urls.length > 0) copy.urls = thumbUrls
+  if (Array.isArray(copy.resultData) && copy.resultData.length > 0) {
+    copy.resultData = copy.resultData.map(value => isImageLikeUrl(value) ? thumbnailUrlForImage(value) : value)
+  }
+  if (copy.imageRef && typeof copy.imageRef === 'object') {
+    const imageRefUrls = (Array.isArray(copy.imageRef.urls) && copy.imageRef.urls.length > 0 ? copy.imageRef.urls : sourceUrls)
+      .map(originalUrlForImageAction)
+      .filter(Boolean)
+    copy.imageRef = {
+      ...copy.imageRef,
+      originalUrl: copy.imageRef.originalUrl || originalUrl,
+      originalImageUrl: copy.imageRef.originalImageUrl || originalUrl,
+      originalUrls: Array.isArray(copy.imageRef.originalUrls) && copy.imageRef.originalUrls.length > 0 ? copy.imageRef.originalUrls : imageRefUrls,
+      fullUrls: Array.isArray(copy.imageRef.fullUrls) && copy.imageRef.fullUrls.length > 0 ? copy.imageRef.fullUrls : imageRefUrls,
+      url: copy.imageRef.url ? thumbUrl : copy.imageRef.url,
+      imageUrl: copy.imageRef.imageUrl ? thumbUrl : copy.imageRef.imageUrl,
+      urls: Array.isArray(copy.imageRef.urls) && copy.imageRef.urls.length > 0 ? imageRefUrls.map(url => thumbnailUrlForImage(url)) : copy.imageRef.urls,
+    }
+  }
+  copy.thumbnailUrl = thumbUrl
+  copy.thumbUrl = thumbUrl
+  return copy
 }
 
 function isoFromTime(value) {
@@ -1226,7 +1435,7 @@ function statusToLocalStatus(status) {
 }
 
 function assetTypeFromUrl(url, fallback = 'image') {
-  const clean = String(url || '').split('?')[0].toLowerCase()
+  const clean = String(originalUrlForImageAction(url) || '').split('?')[0].toLowerCase()
   if (/\.(mp4|mov|webm|m4v|avi|mkv)$/.test(clean)) return 'video'
   if (/\.(mp3|wav|m4a|aac|flac|ogg)$/.test(clean)) return 'audio'
   if (/\.(spz|ply|glb|gltf|obj|fbx|splat|usdz)$/.test(clean)) return 'world'
@@ -1244,7 +1453,8 @@ const localAssetCategories = [
 
 function filenameFromUrl(url, fallback = 'asset') {
   try {
-    const pathname = /^https?:\/\//.test(String(url || '')) ? new URL(url).pathname : String(url || '')
+    const cleanUrl = originalUrlForImageAction(url)
+    const pathname = /^https?:\/\//.test(String(cleanUrl || '')) ? new URL(cleanUrl).pathname : String(cleanUrl || '')
     const name = decodeURIComponent(path.basename(pathname.split('?')[0] || ''))
     return name || fallback
   } catch {
@@ -1500,7 +1710,22 @@ function recordGenerationFinal(taskId) {
   return record
 }
 
-function hydrateLocalRecordsFromSessions() {
+function localRecordsHydrationKey() {
+  return Object.values(localStore.sessions || {})
+    .map(session => {
+      const sessionId = session?.sessionId || ''
+      const nodes = Array.isArray(session?.nodes) ? session.nodes : []
+      const updateTime = session?.updateTime || session?.updatedAt || session?.createTime || ''
+      return `${sessionId}:${updateTime}:${nodes.length}`
+    })
+    .sort()
+    .join('|')
+}
+
+function hydrateLocalRecordsFromSessions({ force = false } = {}) {
+  const signature = localRecordsHydrationKey()
+  if (!force && signature && signature === localRecordsHydrationSignature) return false
+
   let changed = false
   Object.values(localStore.sessions || {}).forEach(session => {
     const sessionId = session.sessionId || ''
@@ -1570,13 +1795,15 @@ function hydrateLocalRecordsFromSessions() {
       changed = true
     })
   })
+  localRecordsHydrationSignature = signature
   if (changed) persistLocalStore()
   return changed
 }
 
 function pageFromQuery(query = {}) {
   const pageNum = Math.max(parseInt(query.pageNum || query.pageIndex) || 1, 1)
-  const pageSize = Math.max(parseInt(query.pageSize) || 20, 1)
+  const requestedPageSize = parseInt(query.pageSize || query.size || query.limit) || LOCAL_LIST_DEFAULT_PAGE_SIZE
+  const pageSize = Math.min(Math.max(requestedPageSize, 1), LOCAL_LIST_MAX_PAGE_SIZE)
   return { pageNum, pageSize }
 }
 
@@ -1598,7 +1825,7 @@ function listLocalGenerationRecords(query = {}) {
   const { pageNum, pageSize } = pageFromQuery(query)
   const start = (pageNum - 1) * pageSize
   return {
-    rows: rows.slice(start, start + pageSize),
+    rows: rows.slice(start, start + pageSize).map(withListThumbnailFields),
     totalCount: rows.length,
     pageNum,
     pageSize,
@@ -1621,7 +1848,7 @@ function listLocalAssetRecords(query = {}) {
   const { pageNum, pageSize } = pageFromQuery(query)
   const start = (pageNum - 1) * pageSize
   return {
-    rows: rows.slice(start, start + pageSize),
+    rows: rows.slice(start, start + pageSize).map(withListThumbnailFields),
     totalCount: rows.length,
     pageNum,
     pageSize,
@@ -1769,15 +1996,19 @@ function resolveLocalImagePath(rootDir, requestPath, prefix) {
   return fp
 }
 
-function resizeWithSips(source, target, maxSize) {
-  return new Promise((resolve, reject) => {
-    const child = spawn('sips', ['-Z', String(maxSize), source, '--out', target], { stdio: 'ignore' })
-    child.on('error', reject)
-    child.on('exit', code => {
-      if (code === 0 && fs.existsSync(target)) resolve()
-      else reject(new Error(`sips exited with ${code}`))
+async function resizeImagePortable(source, target, maxSize) {
+  if (!sharp) {
+    throw new Error('sharp is not installed; server-side thumbnail generation is disabled')
+  }
+  await sharp(source)
+    .rotate()
+    .resize({
+      width: maxSize,
+      height: maxSize,
+      fit: 'inside',
+      withoutEnlargement: true,
     })
-  })
+    .toFile(target)
 }
 
 function makeThumbPath(source, maxSize) {
@@ -1785,6 +2016,96 @@ function makeThumbPath(source, maxSize) {
   const ext = path.extname(source) || '.png'
   const key = crypto.createHash('sha1').update(`${source}:${stat.mtimeMs}:${stat.size}:${maxSize}`).digest('hex')
   return path.join(thumbsDir, `${key}${ext}`)
+}
+
+function remoteThumbPaths(imageUrl, maxSize, ext = 'jpg') {
+  const key = crypto.createHash('sha1').update(`${imageUrl}:${maxSize}`).digest('hex')
+  const cleanExt = String(ext || 'jpg').replace(/[^a-z0-9]/gi, '').toLowerCase() || 'jpg'
+  const source = path.join(thumbsDir, `remote_src_${key}.${cleanExt}`)
+  const thumb = path.join(thumbsDir, `remote_${key}.${cleanExt}`)
+  return { source, thumb }
+}
+
+function downloadImageToFile(imageUrl, target, redirects = 0) {
+  return new Promise((resolve, reject) => {
+    imageUrl = originalUrlForImageAction(imageUrl)
+    if (redirects > 5) return reject(new Error(`too many redirects for image: ${imageUrl}`))
+    let parsed
+    try {
+      parsed = new URL(imageUrl)
+    } catch {
+      reject(new Error('invalid image url'))
+      return
+    }
+    if (!/^https?:$/.test(parsed.protocol)) {
+      reject(new Error('unsupported image protocol'))
+      return
+    }
+    const client = parsed.protocol === 'https:' ? https : http
+    const req = client.get(parsed, res => {
+      const location = res.headers.location
+      if (res.statusCode >= 300 && res.statusCode < 400 && location) {
+        res.resume()
+        const nextUrl = new URL(location, imageUrl).toString()
+        downloadImageToFile(nextUrl, target, redirects + 1).then(resolve, reject)
+        return
+      }
+      if (res.statusCode >= 400) {
+        res.resume()
+        reject(new Error(`failed to download image: HTTP ${res.statusCode}`))
+        return
+      }
+      const contentType = (res.headers['content-type'] || '').split(';')[0]
+      const stream = fs.createWriteStream(target)
+      res.pipe(stream)
+      stream.on('finish', () => stream.close(() => resolve(contentType)))
+      stream.on('error', reject)
+    })
+    req.setTimeout(120000, () => req.destroy(new Error(`image download timeout: ${imageUrl}`)))
+    req.on('error', reject)
+  })
+}
+
+async function sendImageThumb(req, res) {
+  const imageUrl = originalUrlForImageAction(req.query?.url)
+  const maxSize = Math.min(Math.max(parseInt(req.query?.size) || LOCAL_LIST_THUMB_SIZE, 48), 1024)
+  if (!imageUrl) return res.status(400).json(mockFail('url is required'))
+
+  try {
+    if (imageUrl.startsWith('/generated/') || imageUrl.startsWith('/dify/')) {
+      const source = resolveLocalImagePath(imageUrl.startsWith('/dify/') ? path.join(imgDir, 'dify') : imgDir, imageUrl, imageUrl.startsWith('/dify/') ? 'dify' : 'generated')
+      if (!source || !fs.existsSync(source)) return res.status(404).json(mockFail('image not found'))
+      const thumb = makeThumbPath(source, maxSize)
+      if (!fs.existsSync(thumb)) await resizeImagePortable(source, thumb, maxSize)
+      res.set('Cache-Control', 'public, max-age=31536000, immutable')
+      res.type(guessImageMime(thumb))
+      return fs.createReadStream(thumb).pipe(res)
+    }
+
+    if (!/^https?:\/\//i.test(imageUrl)) return res.status(400).json(mockFail('unsupported url'))
+    const parsed = new URL(imageUrl)
+    const ext = imageExtFromMime(guessImageMime(parsed.pathname))
+    const paths = remoteThumbPaths(imageUrl, maxSize, ext)
+    if (!fs.existsSync(paths.thumb)) {
+      if (!fs.existsSync(paths.source)) {
+        const contentType = await downloadImageToFile(imageUrl, paths.source)
+        const downloadedExt = imageExtFromMime(contentType || guessImageMime(parsed.pathname))
+        if (downloadedExt !== ext) {
+          const adjusted = remoteThumbPaths(imageUrl, maxSize, downloadedExt)
+          fs.renameSync(paths.source, adjusted.source)
+          paths.source = adjusted.source
+          paths.thumb = adjusted.thumb
+        }
+      }
+      await resizeImagePortable(paths.source, paths.thumb, maxSize)
+    }
+    res.set('Cache-Control', 'public, max-age=31536000, immutable')
+    res.type(guessImageMime(paths.thumb))
+    return fs.createReadStream(paths.thumb).pipe(res)
+  } catch (err) {
+    console.warn('[image-thumb] failed:', err.message)
+    return res.redirect(imageUrl)
+  }
 }
 
 function serveResizedLocalImage(rootDir, prefix) {
@@ -1814,7 +2135,7 @@ function serveResizedLocalImage(rootDir, prefix) {
     try {
       const thumb = makeThumbPath(source, maxSize)
       if (!fs.existsSync(thumb)) {
-        await resizeWithSips(source, thumb, maxSize)
+        await resizeImagePortable(source, thumb, maxSize)
       }
       res.set('Cache-Control', 'public, max-age=31536000, immutable')
       res.type(guessImageMime(thumb))
@@ -2050,6 +2371,7 @@ app.use('/generated', serveResizedLocalImage(imgDir, 'generated'))
 app.use('/dify', serveResizedLocalImage(path.join(imgDir, 'dify'), 'dify'))
 app.use('/generated', express.static(path.join(__dirname, 'generated')))
 app.use('/dify', express.static(path.join(__dirname, 'generated', 'dify')))
+app.get('/agent/image-thumb', sendImageThumb)
 app.get('/assets/PoseEditorDialog-D7BFxdwD.js', (req, res) => {
   const fp = path.join(__dirname, 'assets', 'PoseEditorDialog-D7BFxdwD.js')
   let src = fs.readFileSync(fp, 'utf8')
@@ -2075,6 +2397,43 @@ app.get('/assets/PoseEditorDialog-D7BFxdwD.js', (req, res) => {
     'const r=await new Promise(s=>{i.toBlob(y=>{s(y)},"image/png")});if(!r)throw new Error("生成图片失败");const t=new File([r],`pose_${Date.now()}.png`,{type:"image/png"}),a=await ue(t,"pose-editor");X("confirm",{imagePoseUrl:a.url,imageUrl:p.value,description:_.value,outputFormat:Aa.value,quality:Ba.value===30?"low":Ba.value===60?"medium":"high",size:Ca.value===0?"auto":Ca.value===1024?"1K":Ca.value===2048?"2K":"4K",aspectRatio:(ge.value?.width&&ge.value?.height?((a=>{const r={1/1:"1:1",5/4:"5:4",9/16:"9:16",21/9:"21:9",16/9:"16:9",4/3:"4:3",3/2:"3:2",4/5:"4:5",3/4:"3:4",2/3:"2:3"};const t=ge.value.width/ge.value.height;let o="1:1",i=Infinity;for(const[s,e]of Object.entries(r)){const n=Math.abs(t-parseFloat(s));n<i&&(i=n,o=e)}return o})(0):"1:1"),width:ge.value?.width||0,height:ge.value?.height||0,prompt:"图一人物换成图二火柴人的姿势，禁止出现火柴人，去除噪点"+(_.value?"「"+_.value+"」":"")})',
     'const Oa=Aa.value==="jpeg"?"image/jpeg":"image/png";const Pa=Aa.value==="jpeg"?Ba.value/100:void 0;const Qa=Aa.value==="jpeg"?"jpg":"png";const Ra=Ca.value>0?(g.value>=h.value?Ca.value:Math.round(Ca.value*(g.value/h.value))):g.value;const Sa=Da.value>0?(h.value>=g.value?Da.value:Math.round(Da.value*(h.value/g.value))):h.value;const Ta=document.createElement("canvas");Ta.width=Ra;Ta.height=Sa;const Ua=Ta.getContext("2d");Ua.drawImage(i,0,0,Ra,Sa);const r=await new Promise(s=>{Ta.toBlob(y=>{s(y)},Oa,Pa)});if(!r)throw new Error("生成图片失败");const t=new File([r],`pose_${Date.now()}.${Qa}`,{type:Oa}),a=await ue(t,"pose-editor");X("confirm",{imagePoseUrl:a.url,imageUrl:p.value,description:_.value,outputFormat:Aa.value,quality:Ba.value===30?"low":Ba.value===60?"medium":"high",size:Ca.value===0?"auto":Ca.value===1024?"1K":Ca.value===2048?"2K":"4K",aspectRatio:(ge.value?.width&&ge.value?.height?((a=>{const r={1/1:"1:1",5/4:"5:4",9/16:"9:16",21/9:"21:9",16/9:"16:9",4/3:"4:3",3/2:"3:2",4/5:"4:5",3/4:"3:4",2/3:"2:3"};const t=ge.value.width/ge.value.height;let o="1:1",i=Infinity;for(const[s,e]of Object.entries(r)){const n=Math.abs(t-parseFloat(s));n<i&&(i=n,o=e)}return o})(0):"1:1"),width:ge.value?.width||0,height:ge.value?.height||0,prompt:"图一人物换成图二火柴人的姿势，禁止出现火柴人，去除噪点"+(_.value?"「"+_.value+"」":"")})'
   )
+  res.set('Content-Type', 'application/javascript; charset=utf-8')
+  res.set('Cache-Control', 'no-store')
+  res.send(src)
+})
+app.get(/^\/assets\/WorkflowCanvas-.*\.js$/, (req, res, next) => {
+  const fp = path.join(__dirname, 'assets', path.basename(req.path))
+  if (!fs.existsSync(fp)) return next()
+  let src = fs.readFileSync(fp, 'utf8')
+  const patches = [
+    [
+      'const B=a.value.filter(se=>v.value.includes(se.id)).flatMap(se=>(se.urls&&se.urls.length?se.urls:[se.url]).filter(Boolean));',
+      'const B=a.value.filter(se=>v.value.includes(se.id)).flatMap(se=>(se.fullUrls&&se.fullUrls.length?se.fullUrls:se.originalUrl?[se.originalUrl]:se.urls&&se.urls.length?se.urls:[se.url]).filter(Boolean));',
+    ],
+    [
+      'const ue=(Array.isArray(B.urls)?B.urls:B.url?[B.url]:[]).filter(Boolean),q=ue[0]||"";',
+      'const ue=(Array.isArray(B.urls)?B.urls:B.url?[B.url]:[]).filter(Boolean),q=ue[0]||"",Ze=(Array.isArray(B.originalUrls)?B.originalUrls:B.originalUrl?[B.originalUrl]:B.fullUrl?[B.fullUrl]:B.originalImageUrl?[B.originalImageUrl]:[]).filter(Boolean),ft=Ze[0]||q;',
+    ],
+    [
+      'return{id:`hist-${le}-${se}-${Date.now()}`,name:J(De),urls:ue,url:le==="world"?De:q,coverUrl:De,type:le,createTime:B.createTime,_raw:B}})',
+      'return{id:`hist-${le}-${se}-${Date.now()}`,name:J(ft),urls:ue,fullUrls:Ze,originalUrl:ft,previewUrl:ft,url:le==="world"?De:q,coverUrl:De,type:le,createTime:B.createTime,_raw:B}})',
+    ],
+    [
+      'u.value=X,d.value=X.url||X.urls&&X.urls[0]||"";',
+      'u.value=X,d.value=X.originalUrl||X.previewUrl||X._raw?.originalUrl||X._raw?.fullUrl||X._raw?.originalImageUrl||X.url||X.urls&&X.urls[0]||"";',
+    ],
+    [
+      'const B=T.value||X.url;',
+      'const B=X.originalUrl||X.previewUrl||X._raw?.originalUrl||X._raw?.fullUrl||T.value||X.url;',
+    ],
+    [
+      'function Oe(X){X.type==="image"&&window.openFullscreenImagePreview?window.openFullscreenImagePreview(X.url,"参考素材"):X.type==="video"&&window.openVideoPreview&&window.openVideoPreview(X.url)}',
+      'function Oe(X){const B=X.originalUrl||X.fullUrl||X.originalImageUrl||X.url;X.type==="image"&&window.openFullscreenImagePreview?window.openFullscreenImagePreview(B,"参考素材"):X.type==="video"&&window.openVideoPreview&&window.openVideoPreview(B)}',
+    ],
+  ]
+  patches.forEach(([from, to]) => {
+    if (src.includes(from)) src = src.split(from).join(to)
+  })
   res.set('Content-Type', 'application/javascript; charset=utf-8')
   res.set('Cache-Control', 'no-store')
   res.send(src)
@@ -2148,8 +2507,9 @@ app.post('/api/script-assets/preview', async (req, res) => {
       delete textBody.model
       delete textBody.modelCode
     }
+    const renderMode = normalizeScriptAssetRenderMode(body.renderMode || body.styleMode || body.style || body.artStyle)
     const textResult = await generateScriptAssetPromptContent(textBody)
-    const items = parseScriptAssetPromptOutput(textResult.content)
+    const items = parseScriptAssetPromptOutput(textResult.content, renderMode)
     if (items.length === 0) {
       return res.json({
         success: false,
@@ -2163,7 +2523,7 @@ app.post('/api/script-assets/preview', async (req, res) => {
       content: textResult.content,
       textModel: textResult.model,
       textProfileId: textResult.profileId,
-      renderMode: normalizeScriptAssetRenderMode(body.renderMode || body.styleMode || body.style || body.artStyle),
+      renderMode,
       items,
     }))
   } catch (err) {
@@ -2181,16 +2541,20 @@ app.post('/api/script-assets/create', async (req, res) => {
     const body = req.body || {}
     const sessionId = String(body.sessionId || body.workspaceId || DEFAULT_SESSION_ID).trim() || DEFAULT_SESSION_ID
     const sourceNodeId = String(body.sourceNodeId || body.nodeId || body.nodeKey || '').trim()
+    const renderMode = normalizeScriptAssetRenderMode(body.renderMode || body.styleMode || body.style || body.artStyle)
     const session = ensureLocalSession(sessionId)
     const rawItems = Array.isArray(body.items) ? body.items : []
     const items = rawItems
-      .map((item, index) => ({
-        id: item.id || `script_asset_item_${index + 1}`,
-        category: item.category || 'asset',
-        categoryLabel: item.categoryLabel || (item.category === 'character' ? '人物' : item.category === 'prop' ? '物品' : item.category === 'scene' ? '场景' : '资产'),
-        name: String(item.name || '').trim() || `资产${index + 1}`,
-        prompt: String(item.prompt || '').trim(),
-      }))
+      .map((item, index) => {
+        const category = item.category || 'asset'
+        return {
+          id: item.id || `script_asset_item_${index + 1}`,
+          category,
+          categoryLabel: item.categoryLabel || (category === 'character' ? '人物' : category === 'prop' ? '物品' : category === 'scene' ? '场景' : '资产'),
+          name: scriptAssetDisplayName(item, `资产${index + 1}`),
+          prompt: normalizeScriptAssetPromptForRenderMode(String(item.prompt || '').trim(), renderMode, category),
+        }
+      })
       .filter(item => item.prompt)
     if (items.length === 0) return res.json(mockFail('请至少选择一个资产进行生成'))
 
@@ -2871,6 +3235,8 @@ app.use((req, res, next) => {
     res.json({
       success: true,
       data: page.rows,
+      list: page.rows,
+      total: page.totalCount,
       totalCount: page.totalCount,
       pageSize: page.pageSize,
       pageIndex: page.pageNum,
@@ -2899,7 +3265,9 @@ app.use((req, res, next) => {
     res.json({
       success: true,
       data: page.rows,
+      list: page.rows,
       assets: page.rows,
+      total: page.totalCount,
       totalCount: page.totalCount,
       pageSize: page.pageSize,
       pageIndex: page.pageNum,
@@ -2994,12 +3362,18 @@ app.use((req, res, next) => {
   app.post('/agent/story-canvas/page-nodes', (req, res) => {
     const session = req.body?.sessionId ? localStore.sessions[req.body.sessionId] : null
     const nodes = Array.isArray(session?.nodes) ? session.nodes : []
-    res.json({ success: true, data: nodes, totalCount: nodes.length, pageSize: req.body?.pageSize || 20, pageIndex: req.body?.pageNum || 1, totalPages: 1 })
+    const { pageNum, pageSize } = pageFromQuery(req.body || {})
+    const start = (pageNum - 1) * pageSize
+    const rows = nodes.slice(start, start + pageSize)
+    res.json({ success: true, data: rows, list: rows, total: nodes.length, totalCount: nodes.length, pageSize, pageIndex: pageNum, totalPages: Math.max(1, Math.ceil(nodes.length / pageSize)) })
   })
   app.get('/agent/story-canvas/page-nodes', (req, res) => {
     const session = req.query?.sessionId ? localStore.sessions[req.query.sessionId] : null
     const nodes = Array.isArray(session?.nodes) ? session.nodes : []
-    res.json({ success: true, data: nodes, totalCount: nodes.length, pageSize: req.query?.pageSize || 20, pageIndex: req.query?.pageNum || 1, totalPages: 1 })
+    const { pageNum, pageSize } = pageFromQuery(req.query || {})
+    const start = (pageNum - 1) * pageSize
+    const rows = nodes.slice(start, start + pageSize)
+    res.json({ success: true, data: rows, list: rows, total: nodes.length, totalCount: nodes.length, pageSize, pageIndex: pageNum, totalPages: Math.max(1, Math.ceil(nodes.length / pageSize)) })
   })
   app.get('/agent/story-canvas/world-model-configs', (req, res) => res.json(mockSuccess([])))
   app.post('/agent/story-canvas/generate-world-model', (req, res) => res.json(mockSuccess({ taskId: 'world_task_' + uid() })))
@@ -3411,6 +3785,7 @@ app.use((req, res, next) => {
 
   function downloadImageFile(imageUrl, index, redirects = 0) {
     return new Promise((resolve, reject) => {
+      imageUrl = originalUrlForImageAction(imageUrl)
       if (redirects > 5) return reject(new Error(`too many redirects for image: ${imageUrl}`))
       const parsed = new URL(imageUrl)
       const client = parsed.protocol === 'https:' ? https : http
@@ -3444,6 +3819,7 @@ app.use((req, res, next) => {
   }
 
   async function toImageFile(url, index) {
+    url = originalUrlForImageAction(url)
     if (url.startsWith('data:')) {
       url = saveDataImageUrl(url, `input_${index}`)
     }
@@ -3479,7 +3855,7 @@ app.use((req, res, next) => {
 
   function normalizeImageUrlList(value) {
     const list = Array.isArray(value) ? value : value ? [value] : []
-    return list.map(item => String(item || '').trim()).filter(Boolean)
+    return list.map(item => originalUrlForImageAction(item)).filter(Boolean)
   }
 
   function normalizeTextPrompt(value) {
@@ -3522,7 +3898,7 @@ app.use((req, res, next) => {
   }
 
   function localImageUrlToChatUrl(imageUrl) {
-    const raw = String(imageUrl || '').trim()
+    const raw = originalUrlForImageAction(imageUrl)
     if (!raw || raw.startsWith('data:image/')) return raw
     try {
       let pathname = raw
