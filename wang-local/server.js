@@ -1650,6 +1650,7 @@ app.use('/assets', express.static(path.join(__dirname, 'assets'), {
   }
 }))
 app.get('/auth-mock.js', (req, res) => {
+  res.set('Cache-Control', 'no-store')
   res.type('application/javascript').sendFile(path.join(__dirname, 'auth-mock.js'))
 })
 app.get('/settings-ui.js', (req, res) => {
