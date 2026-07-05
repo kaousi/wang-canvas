@@ -2,9 +2,11 @@
   'use strict'
 
   const BUTTON_ATTR = 'data-script-assets-generate'
+  const BATCH_BUTTON_ATTR = 'data-script-assets-batch-download'
   const BUS_EVENT_CREATE_NODE = 'agent-create-node'
   const BUS_EVENT_UPDATE_NODE = 'update-node-data'
   const DEFAULT_SESSION_ID = 'demo'
+  const DEFAULT_CONCURRENCY_LIMIT = 20
   const RENDER_MODES = [
     { value: '插画', label: '插画' },
     { value: '3D', label: '3D' },
@@ -12,6 +14,8 @@
   ]
   const activeRequests = new Set()
   const pendingPolls = new Map()
+  const batchPanels = new Map()
+  const sessionNodesCache = { sessionId: '', nodes: [], fetchedAt: 0 }
 
   function ensureStyles() {
     if (document.getElementById('wang-script-assets-style')) return
@@ -78,6 +82,88 @@
         font-size: 13px;
         line-height: 1.45;
         pointer-events: none;
+      }
+      .wang-script-assets-batch-panel {
+        position: fixed;
+        right: 18px;
+        bottom: 18px;
+        z-index: 99980;
+        width: min(360px, calc(100vw - 36px));
+        border: 1px solid rgba(255, 255, 255, 0.14);
+        border-radius: 10px;
+        color: rgba(255, 255, 255, 0.92);
+        background: rgba(18, 18, 20, 0.94);
+        box-shadow: 0 18px 48px rgba(0, 0, 0, 0.42);
+        backdrop-filter: blur(14px);
+        -webkit-backdrop-filter: blur(14px);
+        overflow: hidden;
+      }
+      .wang-script-assets-batch-head {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 10px;
+        padding: 12px 12px 8px;
+      }
+      .wang-script-assets-batch-title {
+        font-size: 13px;
+        font-weight: 650;
+      }
+      .wang-script-assets-batch-close {
+        width: 26px;
+        height: 26px;
+        border: 0;
+        border-radius: 7px;
+        color: rgba(255, 255, 255, 0.68);
+        background: transparent;
+        cursor: pointer;
+        font-size: 18px;
+        line-height: 1;
+      }
+      .wang-script-assets-batch-close:hover {
+        color: #fff;
+        background: rgba(255, 255, 255, 0.08);
+      }
+      .wang-script-assets-batch-body {
+        display: grid;
+        gap: 10px;
+        padding: 0 12px 12px;
+      }
+      .wang-script-assets-batch-meta {
+        color: rgba(255, 255, 255, 0.62);
+        font-size: 12px;
+      }
+      .wang-script-assets-batch-progress {
+        height: 6px;
+        overflow: hidden;
+        border-radius: 999px;
+        background: rgba(255, 255, 255, 0.1);
+      }
+      .wang-script-assets-batch-bar {
+        width: 0%;
+        height: 100%;
+        border-radius: inherit;
+        background: rgba(255, 255, 255, 0.82);
+        transition: width 0.2s ease;
+      }
+      .wang-script-assets-batch-actions {
+        display: flex;
+        justify-content: flex-end;
+        gap: 8px;
+      }
+      .wang-script-assets-batch-download {
+        min-height: 32px;
+        padding: 0 12px;
+        border: 1px solid rgba(255, 255, 255, 0.16);
+        border-radius: 8px;
+        color: #111;
+        background: rgba(255, 255, 255, 0.94);
+        cursor: pointer;
+        font-size: 12px;
+      }
+      .wang-script-assets-batch-download:disabled {
+        cursor: default;
+        opacity: 0.56;
       }
       .wang-script-assets-modal-backdrop {
         position: fixed;
@@ -174,6 +260,40 @@
         border-color: rgba(255, 255, 255, 0.26);
         background: rgba(255, 255, 255, 0.1);
       }
+      .wang-script-assets-settings-grid {
+        display: grid;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        gap: 10px;
+      }
+      .wang-script-assets-field {
+        display: grid;
+        gap: 6px;
+      }
+      .wang-script-assets-field-label {
+        color: rgba(255, 255, 255, 0.7);
+        font-size: 12px;
+      }
+      .wang-script-assets-input {
+        width: 100%;
+        min-height: 36px;
+        box-sizing: border-box;
+        border: 1px solid rgba(255, 255, 255, 0.14);
+        border-radius: 8px;
+        padding: 0 10px;
+        color: rgba(255, 255, 255, 0.92);
+        background: rgba(255, 255, 255, 0.06);
+        outline: none;
+        font-size: 13px;
+      }
+      .wang-script-assets-input:focus {
+        border-color: rgba(255, 255, 255, 0.34);
+        background: rgba(255, 255, 255, 0.09);
+      }
+      .wang-script-assets-field-hint {
+        color: rgba(255, 255, 255, 0.45);
+        font-size: 11px;
+        line-height: 1.35;
+      }
       .wang-script-assets-preview-actions {
         display: flex;
         align-items: center;
@@ -207,7 +327,7 @@
         border-radius: 8px;
         background: rgba(255, 255, 255, 0.045);
       }
-      .wang-script-assets-item input {
+      .wang-script-assets-item-check {
         margin-top: 2px;
         width: 16px;
         height: 16px;
@@ -229,18 +349,37 @@
         text-align: center;
       }
       .wang-script-assets-item-name {
-        overflow: hidden;
-        text-overflow: ellipsis;
-        white-space: nowrap;
+        flex: 1 1 auto;
+        min-width: 0;
+        height: 30px;
+        box-sizing: border-box;
+        border: 1px solid rgba(255, 255, 255, 0.12);
+        border-radius: 7px;
+        padding: 0 8px;
+        color: rgba(255, 255, 255, 0.94);
+        background: rgba(255, 255, 255, 0.055);
+        outline: none;
         font-size: 13px;
         font-weight: 600;
       }
       .wang-script-assets-item-prompt {
-        max-height: 72px;
-        overflow: auto;
+        width: 100%;
+        min-height: 82px;
+        box-sizing: border-box;
+        resize: vertical;
+        border: 1px solid rgba(255, 255, 255, 0.12);
+        border-radius: 7px;
+        padding: 8px;
         color: rgba(255, 255, 255, 0.7);
+        background: rgba(255, 255, 255, 0.045);
+        outline: none;
         font-size: 12px;
         line-height: 1.55;
+      }
+      .wang-script-assets-item-name:focus,
+      .wang-script-assets-item-prompt:focus {
+        border-color: rgba(255, 255, 255, 0.34);
+        background: rgba(255, 255, 255, 0.08);
       }
       .wang-script-assets-empty {
         min-height: 98px;
@@ -314,6 +453,9 @@
         .wang-script-assets-mode-group {
           grid-template-columns: 1fr;
         }
+        .wang-script-assets-settings-grid {
+          grid-template-columns: 1fr;
+        }
         .wang-script-assets-preview-actions,
         .wang-script-assets-modal-footer {
           align-items: stretch;
@@ -344,12 +486,69 @@
     return params.get('workspaceId') || params.get('sessionId') || params.get('id') || DEFAULT_SESSION_ID
   }
 
+  function normalizeConcurrencyLimit(value) {
+    const n = Math.floor(Number(value))
+    return Number.isFinite(n) && n >= 1 ? n : DEFAULT_CONCURRENCY_LIMIT
+  }
+
+  function cleanAssetName(value, fallback = '资产') {
+    const name = String(value || '')
+      .trim()
+      .replace(/^(人物|物品|场景|资产)\s*[-—－:：]\s*/i, '')
+      .trim()
+    return name || fallback
+  }
+
+  function safeFileName(value, fallback = '资产') {
+    return cleanAssetName(value, fallback)
+      .replace(/[\\/:*?"<>|]/g, '_')
+      .replace(/\s+/g, ' ')
+      .replace(/[. ]+$/g, '')
+      .slice(0, 120) || fallback
+  }
+
+  function extensionFromContentType(contentType = '') {
+    const type = String(contentType || '').split(';')[0].trim().toLowerCase()
+    if (type === 'image/jpeg') return 'jpg'
+    if (type === 'image/png') return 'png'
+    if (type === 'image/webp') return 'webp'
+    if (type === 'image/gif') return 'gif'
+    if (type === 'video/mp4') return 'mp4'
+    return ''
+  }
+
+  function extensionFromUrl(url = '') {
+    try {
+      const pathname = new URL(url, window.location.href).pathname
+      const ext = decodeURIComponent(pathname.split('/').pop() || '').split('.').pop()
+      return /^[a-z0-9]{2,5}$/i.test(ext) ? ext.toLowerCase() : ''
+    } catch {
+      return ''
+    }
+  }
+
+  function uniqueFileName(baseName, ext, used) {
+    const cleanBase = safeFileName(baseName)
+    const cleanExt = String(ext || 'png').replace(/[^a-z0-9]/gi, '').toLowerCase() || 'png'
+    let name = `${cleanBase}.${cleanExt}`
+    let index = 2
+    while (used.has(name.toLowerCase())) {
+      name = `${cleanBase}_${index}.${cleanExt}`
+      index += 1
+    }
+    used.add(name.toLowerCase())
+    return name
+  }
+
   function nodeIdFromElement(nodeEl) {
     return nodeEl?.getAttribute('data-id') || nodeEl?.dataset?.id || ''
   }
 
-  async function fetchSessionNode(sessionId, nodeId) {
-    if (!sessionId || !nodeId) return null
+  async function fetchSessionNodes(sessionId) {
+    if (!sessionId) return []
+    if (sessionNodesCache.sessionId === sessionId && Date.now() - sessionNodesCache.fetchedAt < 1600) {
+      return sessionNodesCache.nodes
+    }
     try {
       const resp = await fetch(`/agent/story-canvas/session/${encodeURIComponent(sessionId)}`, {
         credentials: 'same-origin',
@@ -357,10 +556,19 @@
       })
       const json = await resp.json()
       const nodes = json?.data?.nodes || json?.nodes || []
-      return Array.isArray(nodes) ? nodes.find(item => String(item.id || '') === String(nodeId)) || null : null
+      sessionNodesCache.sessionId = sessionId
+      sessionNodesCache.nodes = Array.isArray(nodes) ? nodes : []
+      sessionNodesCache.fetchedAt = Date.now()
+      return sessionNodesCache.nodes
     } catch {
-      return null
+      return []
     }
+  }
+
+  async function fetchSessionNode(sessionId, nodeId) {
+    if (!sessionId || !nodeId) return null
+    const nodes = await fetchSessionNodes(sessionId)
+    return nodes.find(item => String(item.id || '') === String(nodeId)) || null
   }
 
   function textFromDom(nodeEl) {
@@ -442,7 +650,19 @@
           const taskId = row.taskId
           const status = String(row.status || '').toUpperCase()
           const target = pendingPolls.get(taskId)
-          if (!target || !['SUCCESS', 'FAILED'].includes(status)) return
+          if (!target) return
+          if (status === 'PROCESSING') {
+            const queueStatus = String(row.queueStatus || '').toUpperCase()
+            updateNodeData(target.nodeId, {
+              status: 'PENDING',
+              isGenerating: true,
+              generatingMessage: queueStatus === 'QUEUED' ? '排队中...' : '图片生成中...',
+              hasError: false,
+              errorMessage: '',
+            })
+            return
+          }
+          if (!['SUCCESS', 'FAILED'].includes(status)) return
           const resultData = Array.isArray(row.resultData) ? row.resultData.filter(Boolean) : row.resultData ? [row.resultData] : []
           if (status === 'SUCCESS') {
             updateNodeData(target.nodeId, {
@@ -473,6 +693,190 @@
       }
     }
     setTimeout(tick, 1200)
+  }
+
+  function normalizeBatchItems(items = []) {
+    return (Array.isArray(items) ? items : []).map((item, index) => ({
+      taskId: item.taskId || '',
+      nodeId: item.nodeId || item.nodeKey || '',
+      status: String(item.status || 'PROCESSING').toUpperCase(),
+      queueStatus: String(item.queueStatus || '').toUpperCase(),
+      assetName: cleanAssetName(item.assetName || item.name || item.item?.name || `资产${index + 1}`, `资产${index + 1}`),
+      urls: Array.isArray(item.urls) ? item.urls.filter(Boolean) : item.url ? [item.url] : [],
+      errorMessage: item.errorMessage || '',
+    }))
+  }
+
+  async function fetchScriptAssetBatch(batchId) {
+    const resp = await fetch(`/api/script-assets/batch/${encodeURIComponent(batchId)}`, {
+      credentials: 'same-origin',
+      cache: 'no-store',
+    })
+    const json = await resp.json()
+    if (!json?.success) throw new Error(json?.errMessage || json?.message || '获取资产组失败')
+    return {
+      ...(json.data || {}),
+      items: normalizeBatchItems(json?.data?.items || []),
+    }
+  }
+
+  async function downloadBatchToFolder(state) {
+    const doneItems = normalizeBatchItems(state.items)
+      .filter(item => item.status === 'SUCCESS' && item.urls.length > 0)
+    if (doneItems.length === 0) {
+      toast('本组还没有可下载的图片')
+      return
+    }
+
+    let directoryHandle = null
+    const canPickFolder = typeof window.showDirectoryPicker === 'function'
+    if (canPickFolder) {
+      directoryHandle = await window.showDirectoryPicker({ mode: 'readwrite' })
+    }
+
+    state.downloading = true
+    renderBatchPanel(state)
+    const usedNames = new Set()
+    let savedCount = 0
+
+    try {
+      for (const item of doneItems) {
+        for (const url of item.urls) {
+          const resp = await fetch(`/api/script-assets/download-file?url=${encodeURIComponent(url)}`, {
+            credentials: 'same-origin',
+            cache: 'no-store',
+          })
+          if (!resp.ok) throw new Error(`${item.assetName} 下载失败`)
+          const blob = await resp.blob()
+          const ext = resp.headers.get('X-File-Extension') || extensionFromContentType(blob.type) || extensionFromUrl(url) || 'png'
+          const fileName = uniqueFileName(item.assetName, ext, usedNames)
+
+          if (directoryHandle) {
+            const fileHandle = await directoryHandle.getFileHandle(fileName, { create: true })
+            const writable = await fileHandle.createWritable()
+            await writable.write(blob)
+            await writable.close()
+          } else {
+            const objectUrl = URL.createObjectURL(blob)
+            const link = document.createElement('a')
+            link.href = objectUrl
+            link.download = fileName
+            document.body.appendChild(link)
+            link.click()
+            link.remove()
+            setTimeout(() => URL.revokeObjectURL(objectUrl), 15000)
+          }
+          savedCount += 1
+        }
+      }
+      toast(directoryHandle ? `已保存 ${savedCount} 个资产到所选文件夹` : `浏览器不支持选择文件夹，已下载 ${savedCount} 个资产`, 3600)
+    } finally {
+      state.downloading = false
+      renderBatchPanel(state)
+    }
+  }
+
+  function renderBatchPanel(state) {
+    const items = normalizeBatchItems(state.items)
+    const total = Math.max(state.totalCount || items.length || 0, 0)
+    const completed = items.filter(item => item.status === 'SUCCESS' && item.urls.length > 0).length
+    const failed = items.filter(item => item.status === 'FAILED').length
+    const percent = total > 0 ? Math.round((completed / total) * 100) : 0
+    state.metaEl.textContent = total > 0
+      ? `已完成 ${completed} / ${total}${failed ? `，失败 ${failed}` : ''}`
+      : '等待资产任务创建'
+    state.barEl.style.width = `${Math.min(Math.max(percent, 0), 100)}%`
+    state.downloadButton.textContent = state.downloading ? '下载中...' : '选择文件夹下载本组'
+    state.downloadButton.disabled = state.downloading || completed === 0
+  }
+
+  function showBatchDownloadPanel({ batchId, tasks = [], totalCount = 0 }) {
+    if (!batchId) return
+    ensureStyles()
+    const old = batchPanels.get(batchId)
+    if (old?.panelEl) old.panelEl.remove()
+
+    const panel = document.createElement('div')
+    panel.className = 'wang-script-assets-batch-panel'
+    const head = document.createElement('div')
+    head.className = 'wang-script-assets-batch-head'
+    const title = document.createElement('div')
+    title.className = 'wang-script-assets-batch-title'
+    title.textContent = '本组资产下载'
+    const closeButton = document.createElement('button')
+    closeButton.type = 'button'
+    closeButton.className = 'wang-script-assets-batch-close'
+    closeButton.textContent = '×'
+    closeButton.setAttribute('aria-label', '关闭')
+    head.appendChild(title)
+    head.appendChild(closeButton)
+
+    const body = document.createElement('div')
+    body.className = 'wang-script-assets-batch-body'
+    const meta = document.createElement('div')
+    meta.className = 'wang-script-assets-batch-meta'
+    const progress = document.createElement('div')
+    progress.className = 'wang-script-assets-batch-progress'
+    const bar = document.createElement('div')
+    bar.className = 'wang-script-assets-batch-bar'
+    progress.appendChild(bar)
+    const actions = document.createElement('div')
+    actions.className = 'wang-script-assets-batch-actions'
+    const downloadButton = document.createElement('button')
+    downloadButton.type = 'button'
+    downloadButton.className = 'wang-script-assets-batch-download'
+    downloadButton.textContent = '选择文件夹下载本组'
+    actions.appendChild(downloadButton)
+    body.appendChild(meta)
+    body.appendChild(progress)
+    body.appendChild(actions)
+    panel.appendChild(head)
+    panel.appendChild(body)
+    document.body.appendChild(panel)
+
+    const state = {
+      batchId,
+      panelEl: panel,
+      metaEl: meta,
+      barEl: bar,
+      downloadButton,
+      totalCount: totalCount || tasks.length,
+      items: normalizeBatchItems(tasks),
+      downloading: false,
+      timer: null,
+    }
+    batchPanels.set(batchId, state)
+
+    const refresh = async () => {
+      try {
+        const data = await fetchScriptAssetBatch(batchId)
+        state.items = data.items
+        state.totalCount = data.totalCount || state.totalCount || data.items.length
+        renderBatchPanel(state)
+        const allFinished = state.totalCount > 0 && state.items.length >= state.totalCount && state.items.every(item => item.status === 'SUCCESS' || item.status === 'FAILED')
+        if (!allFinished && document.body.contains(panel)) {
+          state.timer = setTimeout(refresh, 3500)
+        }
+      } catch {
+        renderBatchPanel(state)
+        if (document.body.contains(panel)) state.timer = setTimeout(refresh, 5000)
+      }
+    }
+
+    closeButton.addEventListener('click', () => {
+      if (state.timer) clearTimeout(state.timer)
+      batchPanels.delete(batchId)
+      panel.remove()
+    })
+    downloadButton.addEventListener('click', () => {
+      downloadBatchToFolder(state).catch(err => {
+        if (err?.name !== 'AbortError') toast(err.message || '批量下载失败', 4200)
+        state.downloading = false
+        renderBatchPanel(state)
+      })
+    })
+    renderBatchPanel(state)
+    refresh()
   }
 
   function setButtonBusy(button, busy, label = '打开中') {
@@ -528,6 +932,7 @@
     state.selectNoneButton.disabled = state.previewLoading || state.createLoading || state.items.length === 0
     state.closeButton.disabled = state.createLoading
     state.cancelButton.disabled = state.createLoading
+    if (state.concurrencyInput) state.concurrencyInput.disabled = state.previewLoading || state.createLoading
   }
 
   function renderAssetItems(state) {
@@ -550,11 +955,12 @@
     }
 
     state.items.forEach(item => {
-      const row = document.createElement('label')
+      const row = document.createElement('div')
       row.className = 'wang-script-assets-item'
 
       const input = document.createElement('input')
       input.type = 'checkbox'
+      input.className = 'wang-script-assets-item-check'
       input.checked = state.selectedIds.has(item.id)
       input.addEventListener('change', () => {
         if (input.checked) state.selectedIds.add(item.id)
@@ -570,14 +976,22 @@
       badge.className = 'wang-script-assets-badge'
       badge.textContent = item.categoryLabel || '资产'
 
-      const name = document.createElement('span')
+      const name = document.createElement('input')
+      name.type = 'text'
       name.className = 'wang-script-assets-item-name'
       name.title = item.name || ''
-      name.textContent = item.name || '未命名资产'
+      name.value = item.name || '未命名资产'
+      name.addEventListener('input', () => {
+        item.name = name.value
+        name.title = name.value
+      })
 
-      const prompt = document.createElement('div')
+      const prompt = document.createElement('textarea')
       prompt.className = 'wang-script-assets-item-prompt'
-      prompt.textContent = item.prompt || ''
+      prompt.value = item.prompt || ''
+      prompt.addEventListener('input', () => {
+        item.prompt = prompt.value
+      })
 
       head.appendChild(badge)
       head.appendChild(name)
@@ -641,6 +1055,8 @@
       return
     }
 
+    const concurrencyLimit = normalizeConcurrencyLimit(state.concurrencyInput?.value)
+    if (state.concurrencyInput) state.concurrencyInput.value = String(concurrencyLimit)
     state.createLoading = true
     state.error = ''
     updateModalControls(state)
@@ -660,6 +1076,7 @@
           quality: 'high',
           outputFormat: 'png',
           numImages: 1,
+          concurrencyLimit,
         }),
       })
       const json = await resp.json()
@@ -671,14 +1088,20 @@
         ? data.tasks.filter(item => item?.nodeId && item?.taskId)
         : nodes.map(node => ({ nodeId: node.id, taskId: node.data?.taskId })).filter(item => item.nodeId && item.taskId)
 
+      sessionNodesCache.fetchedAt = 0
       const emitted = emitImageNodes(nodeEvents)
       closeAssetModal(state.backdrop)
       if (!emitted && nodes.length > 0) {
         toast('资产节点已保存，刷新页面后可查看', 3200)
       } else {
-        toast(`已创建 ${nodes.length} 个资产图片节点，并发送生成请求`)
+        toast(`已创建 ${nodes.length} 个资产图片节点，并按并发 ${data.concurrencyLimit || concurrencyLimit} 分批生成`)
       }
       pollGeneratedImages(tasks)
+      showBatchDownloadPanel({
+        batchId: data.batchId,
+        tasks,
+        totalCount: nodes.length || tasks.length,
+      })
     } catch (err) {
       setModalError(state, err.message || '创建资产图片节点失败')
     } finally {
@@ -721,6 +1144,34 @@
     modeTitle.textContent = '渲染风格'
     const modeGroup = document.createElement('div')
     modeGroup.className = 'wang-script-assets-mode-group'
+
+    const settingsSection = document.createElement('div')
+    settingsSection.className = 'wang-script-assets-section'
+    const settingsTitle = document.createElement('div')
+    settingsTitle.className = 'wang-script-assets-section-title'
+    settingsTitle.textContent = '生成设置'
+    const settingsGrid = document.createElement('div')
+    settingsGrid.className = 'wang-script-assets-settings-grid'
+    const concurrencyField = document.createElement('label')
+    concurrencyField.className = 'wang-script-assets-field'
+    const concurrencyLabel = document.createElement('span')
+    concurrencyLabel.className = 'wang-script-assets-field-label'
+    concurrencyLabel.textContent = '并发数'
+    const concurrencyInput = document.createElement('input')
+    concurrencyInput.type = 'number'
+    concurrencyInput.className = 'wang-script-assets-input'
+    concurrencyInput.min = '1'
+    concurrencyInput.step = '1'
+    concurrencyInput.inputMode = 'numeric'
+    concurrencyInput.placeholder = String(DEFAULT_CONCURRENCY_LIMIT)
+    concurrencyInput.value = String(DEFAULT_CONCURRENCY_LIMIT)
+    const concurrencyHint = document.createElement('span')
+    concurrencyHint.className = 'wang-script-assets-field-hint'
+    concurrencyHint.textContent = '默认 20，手动输入正整数，不限制上限'
+    concurrencyField.appendChild(concurrencyLabel)
+    concurrencyField.appendChild(concurrencyInput)
+    concurrencyField.appendChild(concurrencyHint)
+    settingsGrid.appendChild(concurrencyField)
 
     const previewSection = document.createElement('div')
     previewSection.className = 'wang-script-assets-section'
@@ -772,6 +1223,9 @@
     body.appendChild(modeSection)
     modeSection.appendChild(modeTitle)
     modeSection.appendChild(modeGroup)
+    body.appendChild(settingsSection)
+    settingsSection.appendChild(settingsTitle)
+    settingsSection.appendChild(settingsGrid)
     body.appendChild(previewSection)
     previewSection.appendChild(previewActions)
     body.appendChild(errorEl)
@@ -798,6 +1252,7 @@
       createButton,
       closeButton,
       cancelButton,
+      concurrencyInput,
       selectAllButton,
       selectNoneButton,
       errorEl,
@@ -896,6 +1351,28 @@
     return button
   }
 
+  function createBatchDownloadButton(batchId) {
+    const button = document.createElement('button')
+    button.type = 'button'
+    button.className = 'wang-script-assets-btn'
+    button.setAttribute(BATCH_BUTTON_ATTR, '1')
+    button.title = '下载同一批生成的资产'
+    button.innerHTML = `
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path>
+        <path d="M7 10l5 5 5-5"></path>
+        <path d="M12 15V3"></path>
+      </svg>
+      <span class="wang-script-assets-label">下载本组</span>
+    `
+    button.addEventListener('click', event => {
+      event.preventDefault()
+      event.stopPropagation()
+      showBatchDownloadPanel({ batchId })
+    }, true)
+    return button
+  }
+
   function mountButton(nodeEl) {
     if (!nodeEl || nodeEl.querySelector(`[${BUTTON_ATTR}]`)) return
     const content = nodeEl.querySelector('.ai-node-content') || nodeEl.querySelector('.ai-node') || nodeEl
@@ -905,9 +1382,33 @@
     content.appendChild(row)
   }
 
+  async function mountBatchDownloadButton(nodeEl) {
+    if (!nodeEl || nodeEl.querySelector(`[${BATCH_BUTTON_ATTR}]`)) return
+    const nodeId = nodeIdFromElement(nodeEl)
+    if (!nodeId) return
+    if (nodeEl.dataset.wangScriptAssetsBatchChecked === nodeId) return
+    nodeEl.dataset.wangScriptAssetsBatchChecked = nodeId
+    const node = await fetchSessionNode(getSessionId(), nodeId)
+    if (!node) {
+      delete nodeEl.dataset.wangScriptAssetsBatchChecked
+      return
+    }
+    const data = node?.data || {}
+    const batchId = data.scriptAssetBatchId || ''
+    if (!batchId || data.source !== 'script-asset-generator') return
+    const content = nodeEl.querySelector('.ai-node-content') || nodeEl.querySelector('.ai-node') || nodeEl
+    const row = document.createElement('div')
+    row.className = 'wang-script-assets-row'
+    row.appendChild(createBatchDownloadButton(batchId))
+    content.appendChild(row)
+  }
+
   function scan() {
     ensureStyles()
     document.querySelectorAll('.vue-flow__node-text').forEach(mountButton)
+    document.querySelectorAll('.vue-flow__node').forEach(nodeEl => {
+      if (!nodeEl.classList.contains('vue-flow__node-text')) mountBatchDownloadButton(nodeEl)
+    })
   }
 
   function start() {

@@ -56,6 +56,7 @@ function loadConfig() {
 const config = loadConfig()
 const PORT = config.port || 3456
 const DEFAULT_SESSION_ID = 'demo'
+const DEFAULT_SCRIPT_ASSET_CONCURRENCY = 20
 let API_BASE = config.apiBaseUrl || ''
 let API_KEY = config.apiKey || ''
 const MODEL = config.model || ''
@@ -218,7 +219,7 @@ function parseScriptAssetPromptOutput(content = '', renderMode = '') {
     const categoryLabel = match[1]
     const category = sectionMap[categoryLabel] || sectionMap[currentSection] || 'asset'
     const name = scriptAssetDisplayName(match[2].trim(), `资产${items.length + 1}`)
-    const prompt = normalizeScriptAssetPromptForRenderMode(line, normalizedRenderMode, category)
+    const prompt = normalizeScriptAssetPromptForRenderMode(scriptAssetPromptBody(match[3] || line), normalizedRenderMode, category)
     items.push({
       id: `script_asset_item_${shortHash(prompt)}_${items.length + 1}`,
       category,
@@ -242,7 +243,7 @@ function scriptAssetRenderModeDirective(renderMode) {
   return [
     '【渲染模式强制约束】',
     '渲染模式为 3D。本次全部资产提示词必须表达为三维资产模型、CG渲染、PBR材质、模型布线感、材质球与三维灯光。',
-    '题材档案中的"写实""摄影感""胶片感"只能转换为"写实质感的3D模型材质与CG灯光"，不得输出真人、摄影、照片、实拍、写实人像、演员、镜头拍摄等词。',
+    '题材档案中的"写实""摄影感""胶片感"只能转换为"3D模型材质与CG灯光"，不得输出真人、摄影、照片、实拍、写实人像、演员、镜头拍摄等词。',
     '最终每条资产提示词中不得出现"真人""摄影""照片""实拍""写实人像"等词。',
   ].join('\n')
 }
@@ -253,6 +254,7 @@ function normalizeScriptAssetPromptForRenderMode(prompt = '', renderMode = '', c
   if (normalizedRenderMode !== '3D' || !text) return text
 
   text = text
+    .replace(/写实质感的/g, '')
     .replace(/（三视图以3D基底呈现：插画为绘画风、3D为三维建模渲染、真人为写实人像；右侧/g, '（三视图以3D基底呈现：三维建模渲染、CG角色模型、PBR材质；右侧')
     .replace(/三视图以3D基底呈现：插画为绘画风、3D为三维建模渲染、真人为写实人像/g, '三视图以3D基底呈现：三维建模渲染、CG角色模型、PBR材质')
     .replace(/；当3D为3D时[^；。]*[；。]/g, '；')
@@ -324,6 +326,20 @@ function scriptAssetDisplayName(item = {}, fallback = '资产') {
   return name || fallback
 }
 
+function scriptAssetPromptBody(prompt = '') {
+  return String(prompt || '')
+    .trim()
+    .replace(/^(人物|物品|场景|资产)\s*[-—－]\s*[^：:\n]{1,80}\s*[：:]\s*/i, '')
+    .replace(/^(人物|物品|场景|资产)\s*[：:]\s*/i, '')
+    .trim()
+}
+
+function normalizeScriptAssetConcurrency(value, fallback = DEFAULT_SCRIPT_ASSET_CONCURRENCY) {
+  const n = Math.floor(Number(value))
+  if (!Number.isFinite(n) || n < 1) return fallback
+  return n
+}
+
 function scriptAssetNodeLabel(item = {}) {
   return scriptAssetDisplayName(item)
 }
@@ -356,6 +372,8 @@ function buildScriptAssetImageNode({ item, nodeId, task, session, sourceNodeId, 
   const dimensions = scriptAssetNodeDimensions(aspectRatio)
   const createdAt = Date.now()
   const displayName = scriptAssetDisplayName(item, `资产${index + 1}`)
+  const taskStatus = String(task?.status || '').toUpperCase()
+  const isQueued = taskStatus === 'QUEUED'
   return {
     id: nodeId,
     type: 'image',
@@ -385,11 +403,13 @@ function buildScriptAssetImageNode({ item, nodeId, task, session, sourceNodeId, 
       reviewed: false,
       taskId: task?.taskId || '',
       isGenerating: !!task?.taskId,
-      generatingMessage: task?.taskId ? '图片生成中...' : '',
+      generatingMessage: task?.taskId ? (isQueued ? '排队中...' : '图片生成中...') : '',
       source: 'script-asset-generator',
       assetCategory: item.category,
       assetName: displayName,
       sourceNodeId: sourceNodeId || '',
+      scriptAssetBatchId: params.batchId || '',
+      scriptAssetBatchIndex: index,
     },
   }
 }
@@ -1147,12 +1167,15 @@ function localTaskStatusPayload(taskId) {
       errorMessage: '本地任务状态已丢失，请重新生成',
     }
   }
-  const status = task.status === 'completed' ? 'SUCCESS' : task.status === 'failed' ? 'FAILED' : 'PROCESSING'
+  const rawStatus = String(task.status || '').toLowerCase()
+  const status = rawStatus === 'completed' ? 'SUCCESS' : rawStatus === 'failed' ? 'FAILED' : 'PROCESSING'
+  const queueStatus = rawStatus === 'queued' ? 'QUEUED' : rawStatus === 'processing' ? 'PROCESSING' : status
   return {
     taskId: id,
     nodeKey: task.nodeKey || '',
     dataType: task.dataType || 'image',
     status,
+    queueStatus,
     resultData: task.status === 'completed' ? normalizeTaskResultData(task.resultData) : [],
     errorMessage: task.errorMessage || null,
   }
@@ -1217,6 +1240,45 @@ function syncTaskResultToLocalNodes(taskId, payload = localTaskStatusPayload(tas
       if (String(node?.data?.taskId || '') === String(taskId || '')) {
         sessionChanged = applyTaskPayloadToNode(node, payload) || sessionChanged
       }
+    })
+    if (sessionChanged) {
+      session.updateTime = nowIso()
+      changed = true
+    }
+  })
+  if (changed) persistLocalStore()
+  return changed
+}
+
+function syncTaskProgressToLocalNodes(taskId, message = '图片生成中...') {
+  const id = String(taskId || '').trim()
+  if (!id) return false
+  let changed = false
+  Object.values(localStore.sessions || {}).forEach(session => {
+    let sessionChanged = false
+    ;(session.nodes || []).forEach(node => {
+      const data = node?.data || {}
+      if (String(data.taskId || '') !== id) return
+      const before = JSON.stringify({
+        status: data.status,
+        isGenerating: data.isGenerating,
+        generatingMessage: data.generatingMessage,
+        hasError: data.hasError,
+        errorMessage: data.errorMessage,
+      })
+      data.status = 'PENDING'
+      data.isGenerating = true
+      data.generatingMessage = message
+      data.hasError = false
+      data.errorMessage = ''
+      const after = JSON.stringify({
+        status: data.status,
+        isGenerating: data.isGenerating,
+        generatingMessage: data.generatingMessage,
+        hasError: data.hasError,
+        errorMessage: data.errorMessage,
+      })
+      if (before !== after) sessionChanged = true
     })
     if (sessionChanged) {
       session.updateTime = nowIso()
@@ -1486,6 +1548,7 @@ function generationRecordView(record = {}) {
   const urls = dataType === 'text' ? [] : resultItems
   const createTime = record.createTime || record.createdAt || nowIso()
   const updateTime = record.updateTime || createTime
+  const assetName = scriptAssetDisplayName(record.assetName || record.name || '', '')
   return {
     id: record.id || `generation_${record.taskId || uid()}`,
     taskId: record.taskId || null,
@@ -1505,6 +1568,10 @@ function generationRecordView(record = {}) {
     outputFormat: record.outputFormat || '',
     promptPresetId: record.promptPresetId || '',
     promptPresetLabel: record.promptPresetLabel || '',
+    assetName,
+    assetCategory: record.assetCategory || record.category || '',
+    scriptAssetBatchId: record.scriptAssetBatchId || record.batchId || '',
+    scriptAssetBatchIndex: Number.isFinite(Number(record.scriptAssetBatchIndex)) ? Number(record.scriptAssetBatchIndex) : null,
     inputImageUrls: normalizeImageUrlList(record.inputImageUrls),
     resultData: dataType === 'text' ? (textContent ? [textContent] : resultItems) : urls,
     urls,
@@ -1542,7 +1609,7 @@ function assetRecordView(record = {}) {
   const createTime = record.createTime || record.createdAt || nowIso()
   const updateTime = record.updateTime || createTime
   const id = record.assetId || record.materialId || record.id || `asset_${shortHash(url || record.textContent || uid())}`
-  const name = record.assetName || record.name || record.fileName || filenameFromUrl(url, assetType === 'text' ? '文本素材' : assetType)
+  const name = scriptAssetDisplayName(record.assetName || record.name || record.fileName || filenameFromUrl(url, assetType === 'text' ? '文本素材' : assetType), assetType === 'text' ? '文本素材' : assetType)
   return {
     id,
     assetId: id,
@@ -1553,13 +1620,15 @@ function assetRecordView(record = {}) {
     sessionId: record.sessionId || '',
     assetType,
     assetCategory: record.assetCategory || record.category || 'other',
+    scriptAssetBatchId: record.scriptAssetBatchId || record.batchId || '',
+    scriptAssetBatchIndex: Number.isFinite(Number(record.scriptAssetBatchIndex)) ? Number(record.scriptAssetBatchIndex) : null,
     assetName: name,
     assetUrl: url,
     dataType: record.dataType || assetType,
     type: assetType,
     source: record.source || 'local',
     name,
-    fileName: record.fileName || filenameFromUrl(url, assetType),
+    fileName: scriptAssetDisplayName(record.fileName || name || filenameFromUrl(url, assetType), name || assetType),
     prompt: record.prompt || '',
     textContent: record.textContent || '',
     duration: record.duration || 0,
@@ -1628,6 +1697,8 @@ function recordAssetsForGeneration(record = {}) {
     return
   }
   view.urls.forEach((url, index) => {
+    const assetName = view.assetName || filenameFromUrl(url, `${view.source || 'image'}_${index + 1}`)
+    const fileName = view.urls.length > 1 ? `${assetName}_${index + 1}` : assetName
     upsertAssetRecord({
       id: `asset_${view.taskId || view.id}_${index}_${shortHash(url)}`,
       generationId: view.id,
@@ -1636,12 +1707,17 @@ function recordAssetsForGeneration(record = {}) {
       sessionId: view.sessionId,
       assetType: view.dataType || 'image',
       dataType: view.dataType || 'image',
+      assetName,
+      assetCategory: view.assetCategory || 'other',
+      scriptAssetBatchId: view.scriptAssetBatchId || '',
+      scriptAssetBatchIndex: view.scriptAssetBatchIndex,
       source: view.source,
       prompt: view.prompt,
       toolType: view.toolType,
       url,
       urls: [url],
-      name: filenameFromUrl(url, `${view.source || 'image'}_${index + 1}`),
+      name: assetName,
+      fileName,
       createTime: view.createTime,
       updateTime: view.updateTime,
     })
@@ -1667,6 +1743,10 @@ function recordGenerationStart(meta = {}) {
     outputFormat: meta.outputFormat || '',
     promptPresetId: meta.promptPresetId || '',
     promptPresetLabel: meta.promptPresetLabel || '',
+    assetName: meta.assetName || '',
+    assetCategory: meta.assetCategory || '',
+    scriptAssetBatchId: meta.scriptAssetBatchId || meta.batchId || '',
+    scriptAssetBatchIndex: meta.scriptAssetBatchIndex,
     inputImageUrls: meta.inputImageUrls || [],
     resultData: [],
     createTime: ts,
@@ -1699,6 +1779,10 @@ function recordGenerationFinal(taskId) {
     outputFormat: task.outputFormat || existing.outputFormat || '',
     promptPresetId: task.promptPresetId || existing.promptPresetId || '',
     promptPresetLabel: task.promptPresetLabel || existing.promptPresetLabel || '',
+    assetName: task.assetName || existing.assetName || '',
+    assetCategory: task.assetCategory || existing.assetCategory || '',
+    scriptAssetBatchId: task.scriptAssetBatchId || existing.scriptAssetBatchId || '',
+    scriptAssetBatchIndex: Number.isFinite(Number(task.scriptAssetBatchIndex)) ? Number(task.scriptAssetBatchIndex) : existing.scriptAssetBatchIndex,
     inputImageUrls: task.inputImageUrls || existing.inputImageUrls || [],
     resultData: status === 'SUCCESS' ? normalizeTaskResultData(task.resultData) : [],
     errorMessage: task.errorMessage || null,
@@ -1764,7 +1848,11 @@ function hydrateLocalRecordsFromSessions({ force = false } = {}) {
           prompt: data.prompt || data.localPrompt || '',
           url,
           urls: [url],
-          name: data.label || data.fileName || filenameFromUrl(url, '图片'),
+          assetName: data.assetName || data.label || data.fileName || filenameFromUrl(url, '图片'),
+          assetCategory: data.assetCategory || 'other',
+          scriptAssetBatchId: data.scriptAssetBatchId || '',
+          scriptAssetBatchIndex: data.scriptAssetBatchIndex,
+          name: data.assetName || data.label || data.fileName || filenameFromUrl(url, '图片'),
           createTime: isoFromTime(data.createdAt || session.createTime),
           updateTime: session.updateTime || nowIso(),
         })
@@ -1784,6 +1872,10 @@ function hydrateLocalRecordsFromSessions({ force = false } = {}) {
         prompt: data.prompt || data.localPrompt || '',
         model: data.model || data.modelName || '',
         modelName: data.modelName || data.model || '',
+        assetName: data.assetName || data.label || '',
+        assetCategory: data.assetCategory || '',
+        scriptAssetBatchId: data.scriptAssetBatchId || '',
+        scriptAssetBatchIndex: data.scriptAssetBatchIndex,
         inputImageUrls: data.connectedImageUrls || [],
         resultData: status === 'SUCCESS' ? resultData : [],
         textContent: dataType === 'text' ? resultData.join('\n\n') : '',
@@ -2541,6 +2633,7 @@ app.post('/api/script-assets/create', async (req, res) => {
     const body = req.body || {}
     const sessionId = String(body.sessionId || body.workspaceId || DEFAULT_SESSION_ID).trim() || DEFAULT_SESSION_ID
     const sourceNodeId = String(body.sourceNodeId || body.nodeId || body.nodeKey || '').trim()
+    const batchId = String(body.batchId || `script_asset_batch_${uid()}`).replace(/[^\w-]/g, '').slice(0, 80) || `script_asset_batch_${uid()}`
     const renderMode = normalizeScriptAssetRenderMode(body.renderMode || body.styleMode || body.style || body.artStyle)
     const session = ensureLocalSession(sessionId)
     const rawItems = Array.isArray(body.items) ? body.items : []
@@ -2552,7 +2645,7 @@ app.post('/api/script-assets/create', async (req, res) => {
           category,
           categoryLabel: item.categoryLabel || (category === 'character' ? '人物' : category === 'prop' ? '物品' : category === 'scene' ? '场景' : '资产'),
           name: scriptAssetDisplayName(item, `资产${index + 1}`),
-          prompt: normalizeScriptAssetPromptForRenderMode(String(item.prompt || '').trim(), renderMode, category),
+          prompt: normalizeScriptAssetPromptForRenderMode(scriptAssetPromptBody(item.prompt || ''), renderMode, category),
         }
       })
       .filter(item => item.prompt)
@@ -2565,7 +2658,12 @@ app.post('/api/script-assets/create', async (req, res) => {
       quality: body.quality || body.outputQuality || 'high',
       outputFormat: body.outputFormat || 'png',
       numImages: body.numImages ?? body.batchSize ?? 1,
+      batchId,
     }
+    const concurrencyLimit = normalizeScriptAssetConcurrency(
+      body.concurrencyLimit ?? body.concurrency ?? body.maxConcurrency ?? body.batchConcurrency,
+      DEFAULT_SCRIPT_ASSET_CONCURRENCY
+    )
     const nodes = []
     const edges = []
     const tasks = []
@@ -2583,10 +2681,15 @@ app.post('/api/script-assets/create', async (req, res) => {
         quality: params.quality,
         outputFormat: params.outputFormat,
         source: 'script-asset-generator',
+        assetName: item.name,
+        assetCategory: item.category,
+        scriptAssetBatchId: batchId,
+        scriptAssetBatchIndex: index,
+        defer: true,
       })
       const node = buildScriptAssetImageNode({ item, nodeId, task, session, sourceNodeId, index, params })
       nodes.push(node)
-      tasks.push({ nodeId, taskId: task.taskId, item })
+      tasks.push({ nodeId, taskId: task.taskId, item, assetName: item.name, assetCategory: item.category, scriptAssetBatchId: batchId, scriptAssetBatchIndex: index })
       if (sourceNodeId) {
         edges.push({
           id: `e-${sourceNodeId}-${nodeId}`,
@@ -2601,12 +2704,15 @@ app.post('/api/script-assets/create', async (req, res) => {
     })
 
     upsertScriptAssetNodes(sessionId, nodes, edges)
-    console.log('[script-assets] create done nodes=%d tasks=%d', nodes.length, tasks.length)
+    startQueuedStoryImageTasks(tasks, concurrencyLimit)
+    console.log('[script-assets] create done nodes=%d tasks=%d concurrency=%d', nodes.length, tasks.length, concurrencyLimit)
     res.json(mockSuccess({
       items,
       nodes,
       edges,
       tasks,
+      batchId,
+      concurrencyLimit,
       nodeEvents: nodes.map((node, index) => scriptAssetNodeEvent(node, sourceNodeId, index, nodes.length)),
     }))
   } catch (err) {
@@ -2618,6 +2724,98 @@ app.post('/api/script-assets/create', async (req, res) => {
     })
   }
 })
+
+function scriptAssetBatchItems(batchId = '') {
+  const id = String(batchId || '').trim()
+  if (!id) return []
+  hydrateLocalRecordsFromSessions()
+  return ensureGenerationRecords()
+    .filter(record => String(record.scriptAssetBatchId || record.batchId || '') === id)
+    .map(record => {
+      const live = localTaskStatusPayload(record.taskId)
+      const liveDone = live && (live.status === 'SUCCESS' || live.status === 'FAILED')
+      const view = generationRecordView({
+        ...record,
+        status: liveDone ? live.status : record.status,
+        resultData: live?.status === 'SUCCESS' ? live.resultData : record.resultData,
+        errorMessage: live?.errorMessage || record.errorMessage,
+      })
+      return {
+        taskId: view.taskId,
+        nodeId: view.nodeKey,
+        status: live?.status || view.status,
+        queueStatus: live?.queueStatus || '',
+        assetName: scriptAssetDisplayName(view.assetName || record.assetName || record.name || record.fileName || view.nodeKey, '资产'),
+        assetCategory: view.assetCategory || record.assetCategory || '',
+        scriptAssetBatchId: id,
+        scriptAssetBatchIndex: Number.isFinite(Number(view.scriptAssetBatchIndex)) ? Number(view.scriptAssetBatchIndex) : 0,
+        urls: normalizeTaskResultData(view.urls?.length ? view.urls : view.resultData).map(originalUrlForImageAction),
+        errorMessage: view.errorMessage || null,
+      }
+    })
+    .sort((a, b) => (a.scriptAssetBatchIndex || 0) - (b.scriptAssetBatchIndex || 0))
+}
+
+app.get('/api/script-assets/batch/:batchId', (req, res) => {
+  const batchId = String(req.params.batchId || '').trim()
+  const items = scriptAssetBatchItems(batchId)
+  const completedCount = items.filter(item => item.status === 'SUCCESS' && item.urls.length > 0).length
+  res.json(mockSuccess({
+    batchId,
+    items,
+    totalCount: items.length,
+    completedCount,
+    failedCount: items.filter(item => item.status === 'FAILED').length,
+    processingCount: items.filter(item => item.status === 'PROCESSING').length,
+  }))
+})
+
+function sendOriginalAssetFile(req, res, redirects = 0) {
+  const raw = originalUrlForImageAction(req.query?.url)
+  if (!raw) return res.status(400).json(mockFail('url is required'))
+  if (redirects > 5) return res.status(502).json(mockFail('too many redirects'))
+
+  try {
+    if (raw.startsWith('/generated/') || raw.startsWith('/dify/')) {
+      const source = resolveLocalImagePath(raw.startsWith('/dify/') ? path.join(imgDir, 'dify') : imgDir, raw, raw.startsWith('/dify/') ? 'dify' : 'generated')
+      if (!source || !fs.existsSync(source)) return res.status(404).json(mockFail('file not found'))
+      res.set('Cache-Control', 'no-store')
+      res.set('X-File-Extension', path.extname(source).replace(/^\./, '') || imageExtFromMime(guessImageMime(source)))
+      res.type(guessImageMime(source))
+      return fs.createReadStream(source).pipe(res)
+    }
+
+    if (!/^https?:\/\//i.test(raw)) return res.status(400).json(mockFail('unsupported url'))
+    const parsed = new URL(raw)
+    const client = parsed.protocol === 'https:' ? https : http
+    const proxy = client.get(parsed, upstream => {
+      const location = upstream.headers.location
+      if (upstream.statusCode >= 300 && upstream.statusCode < 400 && location) {
+        upstream.resume()
+        req.query.url = new URL(location, raw).toString()
+        return sendOriginalAssetFile(req, res, redirects + 1)
+      }
+      if (upstream.statusCode >= 400) {
+        upstream.resume()
+        return res.status(502).json(mockFail(`download failed: HTTP ${upstream.statusCode}`))
+      }
+      const contentType = (upstream.headers['content-type'] || '').split(';')[0] || guessImageMime(parsed.pathname)
+      res.set('Cache-Control', 'no-store')
+      res.set('X-File-Extension', imageExtFromMime(contentType || guessImageMime(parsed.pathname)))
+      res.type(contentType)
+      upstream.pipe(res)
+    })
+    proxy.setTimeout(120000, () => proxy.destroy(new Error(`download timeout: ${raw}`)))
+    proxy.on('error', err => {
+      if (!res.headersSent) res.status(502).json(mockFail(err.message || 'download failed'))
+      else res.destroy(err)
+    })
+  } catch (err) {
+    return res.status(400).json(mockFail(err.message || 'download failed'))
+  }
+}
+
+app.get('/api/script-assets/download-file', sendOriginalAssetFile)
 
 app.post('/api/script-assets/generate', async (req, res) => {
   res.json({
@@ -4225,6 +4423,11 @@ app.use((req, res, next) => {
     promptPresetId = '',
     dataType = 'image',
     source = 'generate-image',
+    assetName = '',
+    assetCategory = '',
+    scriptAssetBatchId = '',
+    scriptAssetBatchIndex = null,
+    defer = false,
   } = {}) {
     const presetResult = applyImagePromptPreset(prompt, promptPresetId)
     const cleanPrompt = presetResult.prompt
@@ -4252,34 +4455,86 @@ app.use((req, res, next) => {
       outputFormat,
       promptPresetId: presetResult.presetId,
       promptPresetLabel: presetResult.presetLabel,
+      assetName: scriptAssetDisplayName(assetName, ''),
+      assetCategory,
+      scriptAssetBatchId,
+      scriptAssetBatchIndex,
       source,
       dataType,
       createdAt: Date.now(),
     }
     recordGenerationStart(taskMeta)
+    aiTasks.set(taskId, { status: 'queued', resultData: null, ...taskMeta })
 
-    if (!useOpenAI()) {
-      aiTasks.set(taskId, { status: 'processing', resultData: null, ...taskMeta })
-      setTimeout(() => {
-        const resultData = Array.from({ length: n }, (_, i) => mockPlaceholder(taskId, i))
-        aiTasks.set(taskId, { status: 'completed', resultData, ...taskMeta })
-        recordGenerationFinal(taskId)
-        syncTaskResultToLocalNodes(taskId)
-        console.log('[generate-image] OpenAI 未配置，mock 完成 taskId=%s source=%s', taskId, source)
-      }, 2000)
-      return {
-        taskId,
-        status: 'PROCESSING',
-        prompt: cleanPrompt,
-        numImages: n,
-        promptPresetId: presetResult.presetId,
-        promptPresetLabel: presetResult.presetLabel,
+    if (!defer) runStoryImageTask(taskId)
+
+    return {
+      taskId,
+      status: defer ? 'QUEUED' : 'PROCESSING',
+      prompt: cleanPrompt,
+      numImages: n,
+      promptPresetId: presetResult.presetId,
+      promptPresetLabel: presetResult.presetLabel,
+    }
+  }
+
+  function runStoryImageTask(taskId, onSettled) {
+    const current = aiTasks.get(String(taskId || ''))
+    if (!current) {
+      if (typeof onSettled === 'function') onSettled(taskId)
+      return
+    }
+    if (current.status === 'completed' || current.status === 'failed') {
+      if (typeof onSettled === 'function') onSettled(taskId)
+      return
+    }
+
+    const taskMeta = {
+      ...current,
+      status: undefined,
+      resultData: undefined,
+      errorMessage: undefined,
+    }
+    delete taskMeta.status
+    delete taskMeta.resultData
+    delete taskMeta.errorMessage
+
+    const {
+      prompt: cleanPrompt,
+      inputImageUrls = [],
+      model,
+      apiSize,
+      numImages: n,
+      quality,
+      outputFormat,
+      source,
+    } = taskMeta
+    const isGpt2 = model === 'gpt-image-2'
+    const settle = () => {
+      if (typeof onSettled === 'function') {
+        try {
+          onSettled(taskId)
+        } catch (err) {
+          console.warn('[generate-image] onSettled failed:', err.message)
+        }
       }
     }
 
-    const isGpt2 = model === 'gpt-image-2'
+    aiTasks.set(taskId, { ...current, status: 'processing', resultData: null, startedAt: Date.now() })
+    syncTaskProgressToLocalNodes(taskId, '图片生成中...')
 
-    aiTasks.set(taskId, { status: 'processing', resultData: null, ...taskMeta })
+    if (!useOpenAI()) {
+      setTimeout(() => {
+        const latest = aiTasks.get(taskId) || taskMeta
+        const resultData = Array.from({ length: n }, (_, i) => mockPlaceholder(taskId, i))
+        aiTasks.set(taskId, { ...latest, status: 'completed', resultData })
+        recordGenerationFinal(taskId)
+        syncTaskResultToLocalNodes(taskId)
+        console.log('[generate-image] OpenAI 未配置，mock 完成 taskId=%s source=%s', taskId, source)
+        settle()
+      }, 2000)
+      return
+    }
 
     ;(async () => {
       try {
@@ -4305,31 +4560,56 @@ app.use((req, res, next) => {
           }
           return img.url
         }))
+        const latest = aiTasks.get(taskId) || taskMeta
         console.log('[generate-image] 成功 taskId=%s images=%d source=%s', taskId, resultData.length, source)
-        aiTasks.set(taskId, { status: 'completed', resultData, ...taskMeta })
+        aiTasks.set(taskId, { ...latest, status: 'completed', resultData })
         recordGenerationFinal(taskId)
         syncTaskResultToLocalNodes(taskId)
       } catch (err) {
         console.error('[generate-image] 失败:', err.message)
+        const latest = aiTasks.get(taskId) || taskMeta
         aiTasks.set(taskId, {
+          ...latest,
           status: 'failed',
           resultData: [],
           errorMessage: err.message || '图片生成失败',
-          ...taskMeta,
         })
         recordGenerationFinal(taskId)
         syncTaskResultToLocalNodes(taskId)
+      } finally {
+        settle()
       }
     })()
+  }
 
-    return {
-      taskId,
-      status: 'PROCESSING',
-      prompt: cleanPrompt,
-      numImages: n,
-      promptPresetId: presetResult.presetId,
-      promptPresetLabel: presetResult.presetLabel,
+  function startQueuedStoryImageTasks(tasks = [], concurrency = DEFAULT_SCRIPT_ASSET_CONCURRENCY) {
+    const queue = (Array.isArray(tasks) ? tasks : []).filter(item => item?.taskId)
+    if (queue.length === 0) return
+    const limit = Math.min(normalizeScriptAssetConcurrency(concurrency), queue.length)
+    let cursor = 0
+    let active = 0
+    let settled = 0
+    const total = queue.length
+
+    const pump = () => {
+      while (active < limit && cursor < total) {
+        const item = queue[cursor]
+        cursor += 1
+        active += 1
+        syncTaskProgressToLocalNodes(item.taskId, `图片生成中... (${cursor}/${total})`)
+        runStoryImageTask(item.taskId, () => {
+          active = Math.max(active - 1, 0)
+          settled += 1
+          if (settled >= total) {
+            console.log('[script-assets] queue done total=%d concurrency=%d', total, limit)
+            return
+          }
+          pump()
+        })
+      }
     }
+    console.log('[script-assets] queue start total=%d concurrency=%d', total, limit)
+    pump()
   }
 
   function handlePoseReferenceImageEdit(req, res) {
