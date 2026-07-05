@@ -3,6 +3,7 @@
 
   const BUTTON_ATTR = 'data-script-assets-generate'
   const BATCH_BUTTON_ATTR = 'data-script-assets-batch-download'
+  const GROUP_BATCH_BUTTON_ATTR = 'data-group-batch-generate'
   const BUS_EVENT_CREATE_NODE = 'agent-create-node'
   const BUS_EVENT_UPDATE_NODE = 'update-node-data'
   const DEFAULT_SESSION_ID = 'demo'
@@ -13,6 +14,7 @@
     { value: '真人', label: '真人' },
   ]
   const activeRequests = new Set()
+  const activeGroupRequests = new Set()
   const pendingPolls = new Map()
   const batchPanels = new Map()
   const sessionNodesCache = { sessionId: '', nodes: [], fetchedAt: 0 }
@@ -62,6 +64,46 @@
       .wang-script-assets-btn svg {
         width: 14px;
         height: 14px;
+        flex: 0 0 auto;
+      }
+      .wang-group-batch-btn {
+        position: absolute;
+        top: 8px;
+        right: 8px;
+        z-index: 20;
+        min-height: 28px;
+        padding: 0 10px;
+        border: 1px solid rgba(255, 255, 255, 0.18);
+        border-radius: 8px;
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
+        color: rgba(255, 255, 255, 0.92);
+        background: rgba(22, 22, 24, 0.74);
+        box-shadow: 0 8px 22px rgba(0, 0, 0, 0.22), inset 0 1px 0 rgba(255, 255, 255, 0.08);
+        backdrop-filter: blur(12px);
+        -webkit-backdrop-filter: blur(12px);
+        font-size: 12px;
+        line-height: 1;
+        font-weight: 560;
+        white-space: nowrap;
+        cursor: pointer;
+        pointer-events: auto;
+        transition: background 0.15s ease, border-color 0.15s ease, transform 0.15s ease, opacity 0.15s ease;
+      }
+      .wang-group-batch-btn:hover {
+        background: rgba(34, 34, 38, 0.9);
+        border-color: rgba(255, 255, 255, 0.3);
+        transform: translateY(-1px);
+      }
+      .wang-group-batch-btn:disabled {
+        cursor: default;
+        opacity: 0.6;
+        transform: none;
+      }
+      .wang-group-batch-btn svg {
+        width: 13px;
+        height: 13px;
         flex: 0 0 auto;
       }
       .wang-script-assets-toast {
@@ -887,6 +929,14 @@
     if (labelEl) labelEl.textContent = busy ? label : '根据剧本生成资产'
   }
 
+  function setGroupBatchBusy(button, busy) {
+    if (!button) return
+    button.disabled = busy
+    button.dataset.busy = busy ? 'true' : 'false'
+    const labelEl = button.querySelector('.wang-group-batch-label')
+    if (labelEl) labelEl.textContent = busy ? '生产中...' : '生产本组'
+  }
+
   function textButton(text, className = 'wang-script-assets-secondary') {
     const button = document.createElement('button')
     button.type = 'button'
@@ -1373,6 +1423,79 @@
     return button
   }
 
+  async function handleGroupBatchClick(event) {
+    event.preventDefault()
+    event.stopPropagation()
+    const button = event.currentTarget
+    const nodeEl = button.closest('.vue-flow__node')
+    const groupId = nodeIdFromElement(nodeEl)
+    const sessionId = getSessionId()
+    if (!groupId) {
+      toast('没有识别到当前分组')
+      return
+    }
+    if (activeGroupRequests.has(groupId)) return
+
+    activeGroupRequests.add(groupId)
+    setGroupBatchBusy(button, true)
+    try {
+      const resp = await fetch('/agent/story-canvas/group-batch-generate', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        credentials: 'same-origin',
+        body: JSON.stringify({
+          sessionId,
+          workspaceId: sessionId,
+          groupId,
+          concurrencyLimit: DEFAULT_CONCURRENCY_LIMIT,
+        }),
+      })
+      const json = await resp.json()
+      if (!json?.success) throw new Error(json?.errMessage || json?.message || '本组批量生产失败')
+      const data = json.data || {}
+      const tasks = Array.isArray(data.tasks) ? data.tasks.filter(item => item?.taskId && item?.nodeId) : []
+      const nodes = Array.isArray(data.nodes) ? data.nodes : []
+      const skippedCount = Array.isArray(data.skipped) ? data.skipped.length : 0
+      if (tasks.length === 0) {
+        toast(skippedCount ? '本组没有可生产的图片节点，请检查提示词' : '本组没有可生产的图片节点', 3600)
+        return
+      }
+      nodes.forEach(node => {
+        if (node?.id && node?.data) updateNodeData(node.id, node.data, true)
+      })
+      sessionNodesCache.fetchedAt = 0
+      pollGeneratedImages(tasks)
+      toast(`已开始生产本组 ${tasks.length} 个图片节点${skippedCount ? `，跳过 ${skippedCount} 个` : ''}`, 3600)
+    } catch (err) {
+      toast(err.message || '本组批量生产失败', 4200)
+    } finally {
+      activeGroupRequests.delete(groupId)
+      setGroupBatchBusy(button, false)
+    }
+  }
+
+  function createGroupBatchButton() {
+    const button = document.createElement('button')
+    button.type = 'button'
+    button.className = 'wang-group-batch-btn'
+    button.setAttribute(GROUP_BATCH_BUTTON_ATTR, '1')
+    button.title = '批量生产本组内有提示词的图片节点'
+    button.innerHTML = `
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="M5 3v18"></path>
+        <path d="M19 3v18"></path>
+        <path d="M8 6h8"></path>
+        <path d="M8 12h8"></path>
+        <path d="M8 18h8"></path>
+      </svg>
+      <span class="wang-group-batch-label">生产本组</span>
+    `
+    button.addEventListener('pointerdown', event => event.stopPropagation(), true)
+    button.addEventListener('mousedown', event => event.stopPropagation(), true)
+    button.addEventListener('click', handleGroupBatchClick, true)
+    return button
+  }
+
   function mountButton(nodeEl) {
     if (!nodeEl || nodeEl.querySelector(`[${BUTTON_ATTR}]`)) return
     const content = nodeEl.querySelector('.ai-node-content') || nodeEl.querySelector('.ai-node') || nodeEl
@@ -1403,10 +1526,26 @@
     content.appendChild(row)
   }
 
+  async function mountGroupBatchButton(nodeEl) {
+    if (!nodeEl || nodeEl.querySelector(`[${GROUP_BATCH_BUTTON_ATTR}]`)) return
+    const nodeId = nodeIdFromElement(nodeEl)
+    if (!nodeId) return
+    if (nodeEl.dataset.wangGroupBatchChecked === nodeId) return
+    nodeEl.dataset.wangGroupBatchChecked = nodeId
+    const node = await fetchSessionNode(getSessionId(), nodeId)
+    if (!node) {
+      delete nodeEl.dataset.wangGroupBatchChecked
+      return
+    }
+    if (node.type !== 'group') return
+    nodeEl.appendChild(createGroupBatchButton())
+  }
+
   function scan() {
     ensureStyles()
     document.querySelectorAll('.vue-flow__node-text').forEach(mountButton)
     document.querySelectorAll('.vue-flow__node').forEach(nodeEl => {
+      mountGroupBatchButton(nodeEl)
       if (!nodeEl.classList.contains('vue-flow__node-text')) mountBatchDownloadButton(nodeEl)
     })
   }

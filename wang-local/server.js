@@ -4736,6 +4736,113 @@ app.use((req, res, next) => {
     pump()
   }
 
+  function generationPromptFromNodeData(data = {}) {
+    return normalizeTextPrompt(data.prompt || data.textPrompt || data.content || data.textContent || data.inputText)
+  }
+
+  function generationReferenceImagesFromNodeData(data = {}) {
+    const status = String(data.status || '').toUpperCase()
+    const explicitRefs = data.connectedImageUrls
+      || data.referenceImageUrls
+      || data.sourceImageUrls
+      || data.imageUrls
+      || data.images
+    if (explicitRefs) return normalizeImageUrlList(explicitRefs)
+    return status === 'SUCCESS' ? [] : normalizeImageUrlList(data.inputImageUrls)
+  }
+
+  function startGroupImageGenerationBatch(body = {}) {
+    const sessionId = String(body.sessionId || body.workspaceId || body.id || DEFAULT_SESSION_ID).trim()
+    const groupId = String(body.groupId || '').trim()
+    if (!groupId) throw new Error('groupId is required')
+
+    const session = ensureLocalSession(sessionId)
+    const nodes = Array.isArray(session.nodes) ? session.nodes : []
+    const groupNode = nodes.find(node => String(node?.id || '') === groupId && node?.type === 'group')
+    if (!groupNode) throw new Error('没有找到当前分组')
+
+    const childIds = new Set([
+      ...(Array.isArray(groupNode.data?.childNodeIds) ? groupNode.data.childNodeIds : []),
+      ...nodes.filter(node => String(node?.parentNode || '') === groupId).map(node => node.id),
+    ].map(String).filter(Boolean))
+    if (childIds.size === 0) throw new Error('当前分组里没有节点')
+
+    const requestedNodeIds = Array.isArray(body.nodeIds) && body.nodeIds.length > 0
+      ? new Set(body.nodeIds.map(String))
+      : null
+    const orderedIds = [
+      ...(Array.isArray(groupNode.data?.childNodeIds) ? groupNode.data.childNodeIds.map(String) : []),
+      ...nodes.filter(node => childIds.has(String(node?.id || ''))).map(node => String(node.id || '')),
+    ]
+    const seen = new Set()
+    const childNodes = orderedIds
+      .filter(id => {
+        if (!id || seen.has(id) || !childIds.has(id)) return false
+        seen.add(id)
+        return !requestedNodeIds || requestedNodeIds.has(id)
+      })
+      .map(id => nodes.find(node => String(node?.id || '') === id))
+      .filter(Boolean)
+
+    const skipped = []
+    const tasks = []
+    const updatedNodes = []
+    childNodes.forEach((node, index) => {
+      if (!['image', 'imageGeneration'].includes(String(node.type || ''))) {
+        skipped.push({ nodeId: node.id, reason: 'unsupported-node-type' })
+        return
+      }
+      const data = node.data || {}
+      const prompt = generationPromptFromNodeData(data)
+      if (!prompt) {
+        skipped.push({ nodeId: node.id, reason: 'empty-prompt' })
+        return
+      }
+
+      const task = startStoryImageTask({
+        nodeKey: node.id,
+        sessionId,
+        prompt,
+        imageUrls: generationReferenceImagesFromNodeData(data),
+        modelName: data.modelName || data.model || body.modelName,
+        aspectRatio: data.aspectRatio || body.aspectRatio || '1:1',
+        numImages: data.batchSize ?? data.numImages ?? data.imageCount ?? body.numImages ?? 1,
+        size: data.resolution || data.size || body.size || '1K',
+        quality: data.outputQuality || data.quality || body.quality,
+        outputFormat: data.outputFormat || body.outputFormat,
+        promptPresetId: data.promptPresetId || data.promptPreset || data.presetId,
+        source: 'group-batch-generation',
+        defer: true,
+      })
+
+      node.data = {
+        ...data,
+        prompt: task.prompt || prompt,
+        taskId: task.taskId,
+        status: 'PENDING',
+        isGenerating: true,
+        generatingMessage: '排队中...',
+        result: null,
+        hasError: false,
+        errorMessage: '',
+        source: data.source || 'group-batch-generation',
+      }
+      tasks.push({ nodeId: node.id, taskId: task.taskId, index, groupId })
+      updatedNodes.push(sanitizeForStore(node))
+    })
+
+    const concurrencyLimit = normalizeScriptAssetConcurrency(
+      body.concurrencyLimit ?? body.concurrency ?? body.maxConcurrency,
+      DEFAULT_SCRIPT_ASSET_CONCURRENCY
+    )
+    if (tasks.length > 0) {
+      session.updateTime = nowIso()
+      persistLocalStore()
+      startQueuedStoryImageTasks(tasks, concurrencyLimit)
+    }
+    return { groupId, tasks, nodes: updatedNodes, skipped, concurrencyLimit, totalCount: tasks.length }
+  }
+
   function handlePoseReferenceImageEdit(req, res) {
     try {
       const body = req.body || {}
@@ -4802,6 +4909,13 @@ app.use((req, res, next) => {
       res.json(mockSuccess(task))
     } catch (err) {
       res.json(mockFail(err.message || '图片生成请求失败'))
+    }
+  })
+  app.post('/agent/story-canvas/group-batch-generate', (req, res) => {
+    try {
+      res.json(mockSuccess(startGroupImageGenerationBatch(req.body || {})))
+    } catch (err) {
+      res.json(mockFail(err.message || '分组批量生成请求失败'))
     }
   })
 
