@@ -586,6 +586,14 @@
     })
   }
 
+  function removeLegacyFloatingImagePromptPresetControls(root = document) {
+    if (!root.querySelectorAll && !root.matches) return
+    const controls = []
+    if (root.matches?.('[data-wang-image-prompt-preset-floating="true"], .wang-image-prompt-preset--floating')) controls.push(root)
+    root.querySelectorAll?.('[data-wang-image-prompt-preset-floating="true"], .wang-image-prompt-preset--floating').forEach(el => controls.push(el))
+    controls.forEach(el => el.remove())
+  }
+
   function installImagePromptPresetUi() {
     window.__wangImagePromptPresets = {
       presets: IMAGE_PROMPT_PRESETS,
@@ -595,6 +603,7 @@
     }
     const start = () => {
       if (!document.body) return
+      removeLegacyFloatingImagePromptPresetControls(document)
       injectInlineImagePromptPresetControls(document)
       applyImagePromptPresetUnlockToPromptFields(document)
       unlockImagePromptPresetGenerateButtons(document)
@@ -632,6 +641,7 @@
         scheduled = true
         requestAnimationFrame(() => {
           scheduled = false
+          removeLegacyFloatingImagePromptPresetControls(document)
           if (pendingRoots.size === 0) injectInlineImagePromptPresetControls(document)
           else {
             const roots = Array.from(pendingRoots)
