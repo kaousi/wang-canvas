@@ -23,59 +23,94 @@
     }
   }
 
-  function normalizeSettings(source = {}) {
-    let profiles = Array.isArray(source.openaiProfiles)
-      ? source.openaiProfiles.map((profile, index) => normalizeProfile(profile, index))
+  function normalizeProfiles(profiles, fallback = {}) {
+    profiles = Array.isArray(profiles)
+      ? profiles.map((profile, index) => normalizeProfile(profile, index))
       : []
-
-    if (profiles.length === 0) {
-      profiles = [normalizeProfile({
-        id: source.activeOpenaiProfileId || 'default',
-        name: source.openaiProfileName || '默认配置',
-        baseUrl: source.openaiBaseUrl || '',
-        apiKey: source.openaiApiKey || '',
-        model: source.openaiModel || 'gpt-4o',
-      }, 0)]
-    }
-
+    if (profiles.length === 0) profiles = [normalizeProfile(fallback, 0)]
     const seen = new Set()
-    profiles = profiles.map((profile, index) => {
+    return profiles.map((profile, index) => {
       let id = profile.id
       if (seen.has(id)) id = `${id}_${index + 1}`
       seen.add(id)
       return { ...profile, id }
     })
+  }
 
-    let activeOpenaiProfileId = source.activeOpenaiProfileId || source.activeOpenaiProfile?.id || profiles[0].id
-    if (!profiles.some(profile => profile.id === activeOpenaiProfileId)) activeOpenaiProfileId = profiles[0].id
-    const active = profiles.find(profile => profile.id === activeOpenaiProfileId) || profiles[0]
+  function normalizeSettings(source = {}) {
+    const imageProfiles = normalizeProfiles(
+      source.imageOpenaiProfiles || source.openaiProfiles,
+      {
+        id: source.activeImageOpenaiProfileId || source.activeOpenaiProfileId || 'default',
+        name: source.openaiProfileName || '图片配置',
+        baseUrl: source.openaiBaseUrl || '',
+        apiKey: source.openaiApiKey || '',
+        model: source.openaiModel || 'gpt-image-2',
+      }
+    )
+    const textProfiles = normalizeProfiles(
+      source.textOpenaiProfiles,
+      {
+        id: source.activeTextOpenaiProfileId || 'text_default',
+        name: source.textOpenaiProfileName || '文本配置',
+        baseUrl: source.textOpenaiBaseUrl || '',
+        apiKey: source.textOpenaiApiKey || '',
+        model: source.textOpenaiModel || 'gpt-4o',
+      }
+    )
+
+    let activeImageOpenaiProfileId = source.activeImageOpenaiProfileId || source.activeOpenaiProfileId || source.activeImageOpenaiProfile?.id || source.activeOpenaiProfile?.id || imageProfiles[0].id
+    if (!imageProfiles.some(profile => profile.id === activeImageOpenaiProfileId)) activeImageOpenaiProfileId = imageProfiles[0].id
+    const activeImage = imageProfiles.find(profile => profile.id === activeImageOpenaiProfileId) || imageProfiles[0]
+
+    let activeTextOpenaiProfileId = source.activeTextOpenaiProfileId || source.activeTextOpenaiProfile?.id || textProfiles[0].id
+    if (!textProfiles.some(profile => profile.id === activeTextOpenaiProfileId)) activeTextOpenaiProfileId = textProfiles[0].id
+    const activeText = textProfiles.find(profile => profile.id === activeTextOpenaiProfileId) || textProfiles[0]
 
     return {
       apiBaseUrl: String(source.apiBaseUrl || '').trim().replace(/\/+$/, ''),
       apiKey: String(source.apiKey || ''),
-      openaiProfiles: profiles,
-      activeOpenaiProfileId,
-      openaiBaseUrl: active?.baseUrl || '',
-      openaiApiKey: active?.apiKey || '',
-      openaiModel: active?.model || 'gpt-4o',
+      imageOpenaiProfiles: imageProfiles,
+      activeImageOpenaiProfileId,
+      openaiProfiles: imageProfiles,
+      activeOpenaiProfileId: activeImageOpenaiProfileId,
+      openaiBaseUrl: activeImage?.baseUrl || '',
+      openaiApiKey: activeImage?.apiKey || '',
+      openaiModel: activeImage?.model || 'gpt-image-2',
+      textOpenaiProfiles: textProfiles,
+      activeTextOpenaiProfileId,
+      textOpenaiBaseUrl: activeText?.baseUrl || '',
+      textOpenaiApiKey: activeText?.apiKey || '',
+      textOpenaiModel: activeText?.model || 'gpt-4o',
       outputFormat: source.outputFormat === 'jpeg' ? 'jpeg' : 'png',
       openaiStreamingEnabled: source.openaiStreamingEnabled !== false,
     }
   }
 
   function mergeSettings(local = {}, server = {}) {
-    const localHasProfiles = Array.isArray(local.openaiProfiles) && local.openaiProfiles.length > 0
-    const serverHasProfiles = Array.isArray(server.openaiProfiles) && server.openaiProfiles.length > 0
+    const localHasProfiles = Array.isArray(local.imageOpenaiProfiles || local.openaiProfiles) && (local.imageOpenaiProfiles || local.openaiProfiles).length > 0
+    const serverHasProfiles = Array.isArray(server.imageOpenaiProfiles || server.openaiProfiles) && (server.imageOpenaiProfiles || server.openaiProfiles).length > 0
     const localHasLegacy = !!(local.openaiBaseUrl || local.openaiApiKey || local.openaiModel)
     const profileSource = localHasProfiles ? local : serverHasProfiles ? server : localHasLegacy ? local : server
+    const localHasTextProfiles = Array.isArray(local.textOpenaiProfiles) && local.textOpenaiProfiles.length > 0
+    const serverHasTextProfiles = Array.isArray(server.textOpenaiProfiles) && server.textOpenaiProfiles.length > 0
+    const localHasTextLegacy = !!(local.textOpenaiBaseUrl || local.textOpenaiApiKey || local.textOpenaiModel)
+    const textProfileSource = localHasTextProfiles ? local : serverHasTextProfiles ? server : localHasTextLegacy ? local : server
     return normalizeSettings({
       ...server,
       ...local,
-      openaiProfiles: profileSource.openaiProfiles,
-      activeOpenaiProfileId: local.activeOpenaiProfileId || server.activeOpenaiProfileId || profileSource.activeOpenaiProfileId,
+      imageOpenaiProfiles: profileSource.imageOpenaiProfiles || profileSource.openaiProfiles,
+      openaiProfiles: profileSource.imageOpenaiProfiles || profileSource.openaiProfiles,
+      activeImageOpenaiProfileId: local.activeImageOpenaiProfileId || local.activeOpenaiProfileId || server.activeImageOpenaiProfileId || server.activeOpenaiProfileId || profileSource.activeImageOpenaiProfileId || profileSource.activeOpenaiProfileId,
+      activeOpenaiProfileId: local.activeImageOpenaiProfileId || local.activeOpenaiProfileId || server.activeImageOpenaiProfileId || server.activeOpenaiProfileId || profileSource.activeImageOpenaiProfileId || profileSource.activeOpenaiProfileId,
       openaiBaseUrl: profileSource.openaiBaseUrl,
       openaiApiKey: profileSource.openaiApiKey,
       openaiModel: profileSource.openaiModel,
+      textOpenaiProfiles: textProfileSource.textOpenaiProfiles,
+      activeTextOpenaiProfileId: local.activeTextOpenaiProfileId || server.activeTextOpenaiProfileId || textProfileSource.activeTextOpenaiProfileId,
+      textOpenaiBaseUrl: textProfileSource.textOpenaiBaseUrl,
+      textOpenaiApiKey: textProfileSource.textOpenaiApiKey,
+      textOpenaiModel: textProfileSource.textOpenaiModel,
     })
   }
 
@@ -92,8 +127,10 @@
     try { localStorage.setItem(LS_KEY, JSON.stringify(normalizeSettings(data))) } catch {}
   }
 
-  function getActiveProfile(settings = loadLocal()) {
-    return settings.openaiProfiles.find(profile => profile.id === settings.activeOpenaiProfileId) || settings.openaiProfiles[0]
+  function getActiveProfile(settings = loadLocal(), kind = 'image') {
+    const profiles = kind === 'text' ? settings.textOpenaiProfiles : settings.imageOpenaiProfiles
+    const activeId = kind === 'text' ? settings.activeTextOpenaiProfileId : settings.activeImageOpenaiProfileId
+    return profiles.find(profile => profile.id === activeId) || profiles[0]
   }
 
   function getApiUrl(path) {
@@ -347,30 +384,55 @@
         <label>代理密钥</label>
         <input id="wang-input-apikey" type="password" placeholder="可选">
       </div>
-      <div class="section-title">AI 模型</div>
+      <div class="section-title">图片生成 API</div>
       <div class="field">
-        <label>当前使用</label>
+        <label>当前图片配置</label>
         <div class="profile-row">
-          <select id="wang-profile-select"></select>
-          <button type="button" class="mini-btn" id="wang-profile-add">新增</button>
-          <button type="button" class="mini-btn danger" id="wang-profile-delete">删除</button>
+          <select id="wang-image-profile-select"></select>
+          <button type="button" class="mini-btn" id="wang-image-profile-add">新增</button>
+          <button type="button" class="mini-btn danger" id="wang-image-profile-delete">删除</button>
         </div>
       </div>
       <div class="field">
         <label>配置名称</label>
-        <input id="wang-input-profile-name" type="text" placeholder="例如：主账号 / 备用 / 本地代理">
+        <input id="wang-input-image-profile-name" type="text" placeholder="例如：图片主账号 / 备用图像接口">
       </div>
       <div class="field">
-        <label>API 地址 (OpenAI 兼容)</label>
-        <input id="wang-input-url" type="text" placeholder="https://sub.g-aisc.com">
+        <label>图片 API 地址 (OpenAI 兼容)</label>
+        <input id="wang-input-image-url" type="text" placeholder="https://sub.g-aisc.com">
       </div>
       <div class="field">
-        <label>API 密钥</label>
-        <input id="wang-input-key" type="password" placeholder="sk-...">
+        <label>图片 API 密钥</label>
+        <input id="wang-input-image-key" type="password" placeholder="sk-...">
       </div>
       <div class="field">
-        <label>模型名称</label>
-        <input id="wang-input-model" type="text" placeholder="gpt-4o">
+        <label>图片模型名称</label>
+        <input id="wang-input-image-model" type="text" placeholder="gpt-image-2">
+      </div>
+      <div class="section-title">文本生成 API</div>
+      <div class="field">
+        <label>当前文本配置</label>
+        <div class="profile-row">
+          <select id="wang-text-profile-select"></select>
+          <button type="button" class="mini-btn" id="wang-text-profile-add">新增</button>
+          <button type="button" class="mini-btn danger" id="wang-text-profile-delete">删除</button>
+        </div>
+      </div>
+      <div class="field">
+        <label>配置名称</label>
+        <input id="wang-input-text-profile-name" type="text" placeholder="例如：文本主账号 / 备用聊天接口">
+      </div>
+      <div class="field">
+        <label>文本 API 地址 (OpenAI 兼容)</label>
+        <input id="wang-input-text-url" type="text" placeholder="https://api.openai.com">
+      </div>
+      <div class="field">
+        <label>文本 API 密钥</label>
+        <input id="wang-input-text-key" type="password" placeholder="sk-...">
+      </div>
+      <div class="field">
+        <label>文本模型名称</label>
+        <input id="wang-input-text-model" type="text" placeholder="gpt-4o">
       </div>
       <div class="field">
         <label>输出格式</label>
@@ -400,12 +462,14 @@
     document.body.appendChild(overlayEl)
   }
 
-  function setProfileFields(profile) {
+  function setProfileFields(kind, profile) {
+    const prefix = kind === 'text' ? 'text' : 'image'
+    const fallbackModel = kind === 'text' ? 'gpt-4o' : 'gpt-image-2'
     const values = {
-      'wang-input-profile-name': profile?.name || '',
-      'wang-input-url': profile?.baseUrl || '',
-      'wang-input-key': profile?.apiKey || '',
-      'wang-input-model': profile?.model || 'gpt-4o',
+      [`wang-input-${prefix}-profile-name`]: profile?.name || '',
+      [`wang-input-${prefix}-url`]: profile?.baseUrl || '',
+      [`wang-input-${prefix}-key`]: profile?.apiKey || '',
+      [`wang-input-${prefix}-model`]: profile?.model || fallbackModel,
     }
     Object.entries(values).forEach(([id, value]) => {
       const el = document.getElementById(id)
@@ -413,13 +477,16 @@
     })
   }
 
-  function renderProfileSelect(settings = draftSettings || loadLocal()) {
-    const select = document.getElementById('wang-profile-select')
+  function renderProfileSelect(kind, settings = draftSettings || loadLocal()) {
+    const prefix = kind === 'text' ? 'text' : 'image'
+    const select = document.getElementById(`wang-${prefix}-profile-select`)
     if (!select) return
-    select.innerHTML = settings.openaiProfiles
+    const profiles = kind === 'text' ? settings.textOpenaiProfiles : settings.imageOpenaiProfiles
+    const activeId = kind === 'text' ? settings.activeTextOpenaiProfileId : settings.activeImageOpenaiProfileId
+    select.innerHTML = profiles
       .map(profile => `<option value="${escapeHtml(profile.id)}">${escapeHtml(profile.name)}</option>`)
       .join('')
-    select.value = settings.activeOpenaiProfileId
+    select.value = activeId
   }
 
   function readSettingsFromDialog() {
@@ -429,15 +496,26 @@
     settings.outputFormat = document.getElementById('wang-input-format')?.value === 'jpeg' ? 'jpeg' : 'png'
     settings.openaiStreamingEnabled = document.getElementById('wang-input-streaming')?.value !== 'non_stream'
 
-    const active = getActiveProfile(settings)
-    if (active) {
-      active.name = (document.getElementById('wang-input-profile-name')?.value || active.name || '默认配置').trim() || '默认配置'
-      active.baseUrl = (document.getElementById('wang-input-url')?.value || '').trim().replace(/\/+$/, '')
-      active.apiKey = document.getElementById('wang-input-key')?.value || ''
-      active.model = (document.getElementById('wang-input-model')?.value || 'gpt-4o').trim() || 'gpt-4o'
-      settings.openaiBaseUrl = active.baseUrl
-      settings.openaiApiKey = active.apiKey
-      settings.openaiModel = active.model
+    const activeImage = getActiveProfile(settings, 'image')
+    if (activeImage) {
+      activeImage.name = (document.getElementById('wang-input-image-profile-name')?.value || activeImage.name || '图片配置').trim() || '图片配置'
+      activeImage.baseUrl = (document.getElementById('wang-input-image-url')?.value || '').trim().replace(/\/+$/, '')
+      activeImage.apiKey = document.getElementById('wang-input-image-key')?.value || ''
+      activeImage.model = (document.getElementById('wang-input-image-model')?.value || 'gpt-image-2').trim() || 'gpt-image-2'
+      settings.openaiBaseUrl = activeImage.baseUrl
+      settings.openaiApiKey = activeImage.apiKey
+      settings.openaiModel = activeImage.model
+    }
+
+    const activeText = getActiveProfile(settings, 'text')
+    if (activeText) {
+      activeText.name = (document.getElementById('wang-input-text-profile-name')?.value || activeText.name || '文本配置').trim() || '文本配置'
+      activeText.baseUrl = (document.getElementById('wang-input-text-url')?.value || '').trim().replace(/\/+$/, '')
+      activeText.apiKey = document.getElementById('wang-input-text-key')?.value || ''
+      activeText.model = (document.getElementById('wang-input-text-model')?.value || 'gpt-4o').trim() || 'gpt-4o'
+      settings.textOpenaiBaseUrl = activeText.baseUrl
+      settings.textOpenaiApiKey = activeText.apiKey
+      settings.textOpenaiModel = activeText.model
     }
 
     draftSettings = normalizeSettings(settings)
@@ -455,8 +533,10 @@
     const streaming = document.getElementById('wang-input-streaming')
     if (streaming) streaming.value = local.openaiStreamingEnabled === false ? 'non_stream' : 'stream'
     window.__openaiStreamingEnabled = streaming?.value !== 'non_stream'
-    renderProfileSelect(local)
-    setProfileFields(getActiveProfile(local))
+    renderProfileSelect('image', local)
+    renderProfileSelect('text', local)
+    setProfileFields('image', getActiveProfile(local, 'image'))
+    setProfileFields('text', getActiveProfile(local, 'text'))
     overlayEl.classList.add('open')
     checkStatus()
   }
@@ -470,35 +550,51 @@
     const bar = document.getElementById('wang-status-bar')
     if (!bar) return
     const proxyUrl = document.getElementById('wang-input-apibase')?.value || ''
-    const aiUrl = document.getElementById('wang-input-url')?.value || ''
-    const aiKey = document.getElementById('wang-input-key')?.value || ''
-    const profileName = document.getElementById('wang-input-profile-name')?.value || '当前配置'
-    if (!proxyUrl && !aiKey) {
+    const imageUrl = document.getElementById('wang-input-image-url')?.value || ''
+    const imageKey = document.getElementById('wang-input-image-key')?.value || ''
+    const imageName = document.getElementById('wang-input-image-profile-name')?.value || '图片配置'
+    const textUrl = document.getElementById('wang-input-text-url')?.value || ''
+    const textKey = document.getElementById('wang-input-text-key')?.value || ''
+    const textName = document.getElementById('wang-input-text-profile-name')?.value || '文本配置'
+    if (!proxyUrl && !imageKey && !textKey) {
       bar.innerHTML = '<span class="dot red"></span><span>未配置任一服务</span>'
       return
     }
     const parts = []
     if (proxyUrl) parts.push('代理: ' + escapeHtml(proxyUrl))
-    if (aiKey && !aiUrl) parts.push(escapeHtml(profileName) + ': 缺少 API 地址')
-    if (aiKey && aiUrl) {
-      bar.innerHTML = '<span class="dot yellow"></span><span>检测 AI 连接...</span>'
+    const checks = [
+      { label: '图片', name: imageName, url: imageUrl, key: imageKey },
+      { label: '文本', name: textName, url: textUrl, key: textKey },
+    ].filter(item => item.key || item.url)
+    if (checks.some(item => item.key && item.url)) {
+      bar.innerHTML = '<span class="dot yellow"></span><span>检测 API 连接...</span>'
+    }
+    for (const item of checks) {
+      if (item.key && !item.url) {
+        parts.push(item.label + ': 缺少 API 地址')
+        continue
+      }
+      if (!item.key && item.url) {
+        parts.push(item.label + ': 缺少 API 密钥')
+        continue
+      }
       try {
-        const r = await fetch(aiUrl.replace(/\/+$/, '') + '/v1/models', {
-          headers: { 'Authorization': 'Bearer ' + aiKey },
+        const r = await fetch(item.url.replace(/\/+$/, '') + '/v1/models', {
+          headers: { 'Authorization': 'Bearer ' + item.key },
         })
         if (r.ok) {
           const data = await r.json()
           const count = data?.data?.length || 0
-          parts.push(escapeHtml(profileName) + ': 可用 (' + count + ' 模型)')
+          parts.push(item.label + ' ' + escapeHtml(item.name) + ': 可用 (' + count + ' 模型)')
         } else {
           const err = await r.json().catch(() => ({}))
-          parts.push(escapeHtml(profileName) + ': ' + escapeHtml(err.error?.message || String(r.status)))
+          parts.push(item.label + ' ' + escapeHtml(item.name) + ': ' + escapeHtml(err.error?.message || String(r.status)))
         }
       } catch {
-        parts.push(escapeHtml(profileName) + ': 连接失败')
+        parts.push(item.label + ' ' + escapeHtml(item.name) + ': 连接失败')
       }
     }
-    bar.innerHTML = '<span class="dot ' + (proxyUrl || aiKey ? 'green' : 'red') + '"></span><span>' + parts.join(' | ') + '</span>'
+    bar.innerHTML = '<span class="dot ' + (proxyUrl || imageKey || textKey ? 'green' : 'red') + '"></span><span>' + parts.join(' | ') + '</span>'
   }
 
   function scheduleStatusCheck() {
@@ -516,59 +612,78 @@
     hideDialog()
   }
 
-  function addProfile() {
+  function addProfile(kind = 'image') {
     const settings = readSettingsFromDialog()
+    const profiles = kind === 'text' ? settings.textOpenaiProfiles : settings.imageOpenaiProfiles
     const profile = normalizeProfile({
       id: createProfileId(),
-      name: `配置 ${settings.openaiProfiles.length + 1}`,
+      name: `${kind === 'text' ? '文本配置' : '图片配置'} ${profiles.length + 1}`,
       baseUrl: '',
       apiKey: '',
-      model: getActiveProfile(settings)?.model || 'gpt-4o',
-    }, settings.openaiProfiles.length)
-    settings.openaiProfiles.push(profile)
-    settings.activeOpenaiProfileId = profile.id
+      model: getActiveProfile(settings, kind)?.model || (kind === 'text' ? 'gpt-4o' : 'gpt-image-2'),
+    }, profiles.length)
+    profiles.push(profile)
+    if (kind === 'text') settings.activeTextOpenaiProfileId = profile.id
+    else {
+      settings.activeImageOpenaiProfileId = profile.id
+      settings.activeOpenaiProfileId = profile.id
+    }
     draftSettings = normalizeSettings(settings)
-    renderProfileSelect(settings)
-    setProfileFields(profile)
+    renderProfileSelect(kind, draftSettings)
+    setProfileFields(kind, profile)
     scheduleStatusCheck()
   }
 
-  function deleteProfile() {
+  function deleteProfile(kind = 'image') {
     const settings = readSettingsFromDialog()
-    if (settings.openaiProfiles.length <= 1) {
-      const profile = settings.openaiProfiles[0]
-      profile.name = '默认配置'
+    const profiles = kind === 'text' ? settings.textOpenaiProfiles : settings.imageOpenaiProfiles
+    if (profiles.length <= 1) {
+      const profile = profiles[0]
+      profile.name = kind === 'text' ? '文本配置' : '图片配置'
       profile.baseUrl = ''
       profile.apiKey = ''
-      profile.model = 'gpt-4o'
+      profile.model = kind === 'text' ? 'gpt-4o' : 'gpt-image-2'
       draftSettings = normalizeSettings(settings)
-      renderProfileSelect(settings)
-      setProfileFields(profile)
+      renderProfileSelect(kind, draftSettings)
+      setProfileFields(kind, profile)
       scheduleStatusCheck()
       return
     }
-    const activeId = settings.activeOpenaiProfileId
-    settings.openaiProfiles = settings.openaiProfiles.filter(profile => profile.id !== activeId)
-    settings.activeOpenaiProfileId = settings.openaiProfiles[0].id
+    const activeId = kind === 'text' ? settings.activeTextOpenaiProfileId : settings.activeImageOpenaiProfileId
+    const nextProfiles = profiles.filter(profile => profile.id !== activeId)
+    if (kind === 'text') {
+      settings.textOpenaiProfiles = nextProfiles
+      settings.activeTextOpenaiProfileId = nextProfiles[0].id
+    } else {
+      settings.imageOpenaiProfiles = nextProfiles
+      settings.openaiProfiles = nextProfiles
+      settings.activeImageOpenaiProfileId = nextProfiles[0].id
+      settings.activeOpenaiProfileId = nextProfiles[0].id
+    }
     draftSettings = normalizeSettings(settings)
-    renderProfileSelect(settings)
-    setProfileFields(getActiveProfile(settings))
+    renderProfileSelect(kind, draftSettings)
+    setProfileFields(kind, getActiveProfile(draftSettings, kind))
     scheduleStatusCheck()
   }
 
-  function switchProfile(profileId) {
+  function switchProfile(kind, profileId) {
     const settings = readSettingsFromDialog()
-    settings.activeOpenaiProfileId = profileId
+    if (kind === 'text') settings.activeTextOpenaiProfileId = profileId
+    else {
+      settings.activeImageOpenaiProfileId = profileId
+      settings.activeOpenaiProfileId = profileId
+    }
     const normalized = normalizeSettings(settings)
     draftSettings = normalized
-    renderProfileSelect(normalized)
-    setProfileFields(getActiveProfile(normalized))
+    renderProfileSelect(kind, normalized)
+    setProfileFields(kind, getActiveProfile(normalized, kind))
     scheduleStatusCheck()
   }
 
   function hasConfig(settings = loadLocal()) {
-    const active = getActiveProfile(settings)
-    return !!(settings.apiBaseUrl || active?.apiKey)
+    const image = getActiveProfile(settings, 'image')
+    const text = getActiveProfile(settings, 'text')
+    return !!(settings.apiBaseUrl || image?.apiKey || text?.apiKey)
   }
 
   function createButton() {
@@ -599,19 +714,25 @@
       if (e.target.closest('#wang-settings-overlay') && !e.target.closest('#wang-settings-dialog')) hideDialog()
       if (e.target.id === 'wang-btn-cancel') hideDialog()
       if (e.target.id === 'wang-btn-save') saveSettings()
-      if (e.target.id === 'wang-profile-add') addProfile()
-      if (e.target.id === 'wang-profile-delete') deleteProfile()
+      if (e.target.id === 'wang-image-profile-add') addProfile('image')
+      if (e.target.id === 'wang-image-profile-delete') deleteProfile('image')
+      if (e.target.id === 'wang-text-profile-add') addProfile('text')
+      if (e.target.id === 'wang-text-profile-delete') deleteProfile('text')
     })
     document.addEventListener('change', (e) => {
-      if (e.target.id === 'wang-profile-select') switchProfile(e.target.value)
+      if (e.target.id === 'wang-image-profile-select') switchProfile('image', e.target.value)
+      if (e.target.id === 'wang-text-profile-select') switchProfile('text', e.target.value)
       if (e.target.id === 'wang-input-format') window.__outputFormat = e.target.value || 'png'
       if (e.target.id === 'wang-input-streaming') window.__openaiStreamingEnabled = e.target.value !== 'non_stream'
     })
     document.addEventListener('input', (e) => {
       if (
-        e.target.id === 'wang-input-url' ||
-        e.target.id === 'wang-input-key' ||
-        e.target.id === 'wang-input-profile-name' ||
+        e.target.id === 'wang-input-image-url' ||
+        e.target.id === 'wang-input-image-key' ||
+        e.target.id === 'wang-input-image-profile-name' ||
+        e.target.id === 'wang-input-text-url' ||
+        e.target.id === 'wang-input-text-key' ||
+        e.target.id === 'wang-input-text-profile-name' ||
         e.target.id === 'wang-input-apibase'
       ) {
         scheduleStatusCheck()

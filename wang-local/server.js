@@ -32,6 +32,11 @@ function loadConfig() {
     authToken: '',
     openaiProfiles: [],
     activeOpenaiProfileId: '',
+    textOpenaiProfiles: [],
+    activeTextOpenaiProfileId: '',
+    textOpenaiBaseUrl: '',
+    textOpenaiApiKey: '',
+    textOpenaiModel: '',
     openaiStreamingEnabled: true,
     outputFormat: 'png',
   }
@@ -45,6 +50,7 @@ function loadConfig() {
 }
 const config = loadConfig()
 const PORT = config.port || 3456
+const DEFAULT_SESSION_ID = 'demo'
 let API_BASE = config.apiBaseUrl || ''
 let API_KEY = config.apiKey || ''
 const MODEL = config.model || ''
@@ -55,7 +61,19 @@ let OPENAI_BASE = ''
 let OPENAI_KEY = ''
 let OPENAI_MODEL = ''
 let OPENAI_STREAMING_ENABLED = normalizeOpenAIStreamingEnabled(config)
+let TEXT_OPENAI_PROFILES = normalizeOpenAIProfiles({
+  openaiProfiles: config.textOpenaiProfiles || [],
+  activeOpenaiProfileId: config.activeTextOpenaiProfileId || '',
+  openaiBaseUrl: config.textOpenaiBaseUrl || '',
+  openaiApiKey: config.textOpenaiApiKey || '',
+  openaiModel: config.textOpenaiModel || '',
+})
+let ACTIVE_TEXT_OPENAI_PROFILE_ID = config.activeTextOpenaiProfileId || TEXT_OPENAI_PROFILES[0]?.id || ''
+let TEXT_OPENAI_BASE = ''
+let TEXT_OPENAI_KEY = ''
+let TEXT_OPENAI_MODEL = ''
 refreshActiveOpenAIGlobals()
+refreshActiveTextOpenAIGlobals()
 
 const app = express()
 app.use(express.json({ limit: '200mb' }))
@@ -86,6 +104,7 @@ app.use((req, res, next) => {
 
 // ── Helpers ──
 const useOpenAI = () => !!(OPENAI_BASE && OPENAI_KEY)
+const useTextOpenAI = () => !!(TEXT_OPENAI_BASE && TEXT_OPENAI_KEY)
 
 function uid() {
   return crypto.randomUUID().replace(/-/g, '').slice(0, 24)
@@ -133,6 +152,223 @@ function applyImagePromptPreset(prompt, presetId) {
     prompt: `${preset.prompt}${cleanPrompt}`,
     presetId: preset.id,
     presetLabel: preset.label,
+  }
+}
+
+const SCRIPT_ASSET_PROMPT_SYSTEM_PATH = path.join(__dirname, 'script-asset-prompt-system.txt')
+const SCRIPT_ASSET_PROMPT_SYSTEM_FALLBACK = [
+  '你是一个确定性的概念艺术提示词生成引擎。',
+  '输入小说或剧本文本后，只输出三个板块：## 人物、## 物品、## 场景。',
+  '每条必须分别以“人物 - 名称：”“物品 - 名称：”“场景 - 名称：”开头，且内容必须是可直接用于 AI 图片生成的详细提示词。',
+  '人物提示词必须包含全身三视图、正面黑白素描面部特写、右侧三视图脸部白色正方形色块打码、无背景、双手空置不持物。',
+  '物品提示词必须生成物品三视图，背景纯净无干扰。',
+  '场景提示词必须是纯环境空景，不得出现任何人物、人形或角色。',
+  '只输出这三个板块，不要解释、不要统计、不要输出题材判定过程。',
+].join('\n')
+
+function scriptAssetPromptSystemText() {
+  try {
+    const text = fs.readFileSync(SCRIPT_ASSET_PROMPT_SYSTEM_PATH, 'utf8').trim()
+    return text || SCRIPT_ASSET_PROMPT_SYSTEM_FALLBACK
+  } catch {
+    return SCRIPT_ASSET_PROMPT_SYSTEM_FALLBACK
+  }
+}
+
+function parseScriptAssetPromptOutput(content = '') {
+  const sectionMap = {
+    人物: 'character',
+    物品: 'prop',
+    场景: 'scene',
+  }
+  const items = []
+  let currentSection = ''
+  String(content || '').split(/\r?\n/).forEach(rawLine => {
+    const line = rawLine.trim()
+    if (!line) return
+    const heading = line.match(/^##\s*(人物|物品|场景)\s*$/)
+    if (heading) {
+      currentSection = heading[1]
+      return
+    }
+    if (/^[(（]\s*无\s*[)）]$/.test(line)) return
+    const match = line.match(/^(人物|物品|场景)\s*-\s*([^：:]+)\s*[：:]\s*([\s\S]+)$/)
+    if (!match) return
+    const categoryLabel = match[1]
+    const category = sectionMap[categoryLabel] || sectionMap[currentSection] || 'asset'
+    const name = match[2].trim()
+    const prompt = line
+    items.push({
+      id: `script_asset_item_${shortHash(prompt)}_${items.length + 1}`,
+      category,
+      categoryLabel,
+      name,
+      prompt,
+    })
+  })
+  return items
+}
+
+function normalizeScriptAssetRenderMode(value = '') {
+  const raw = String(value || '').trim().toLowerCase()
+  if (['3d', '3D'.toLowerCase(), 'three', '三维', '三维建模'].includes(raw)) return '3D'
+  if (['真人', '写实真人', 'real', 'realistic', 'photo', 'photorealistic'].includes(raw)) return '真人'
+  return '插画'
+}
+
+function buildScriptAssetPromptInput(script, body = {}) {
+  const renderMode = normalizeScriptAssetRenderMode(body.renderMode || body.styleMode || body.style || body.artStyle)
+  const configLines = [
+    `渲染模式: ${renderMode}`,
+    '语言: 中文',
+  ]
+  if (body.maxPerCategory) configLines.push(`每类上限: ${Math.max(parseInt(body.maxPerCategory) || 12, 1)}`)
+  if (body.appearanceThreshold) configLines.push(`出现阈值: ${Math.max(parseInt(body.appearanceThreshold) || 2, 1)}`)
+  if (body.itemBackground) configLines.push(`物品背景: ${String(body.itemBackground).trim()}`)
+  if (body.genreStyle) configLines.push(`风格: ${String(body.genreStyle).trim()}`)
+  if (body.period) configLines.push(`年代: ${String(body.period).trim()}`)
+  return [
+    '【配置】',
+    configLines.join('\n'),
+    '',
+    '【正文】',
+    script,
+  ].join('\n')
+}
+
+function scriptAssetNodeLabel(item = {}) {
+  const prefix = item.categoryLabel || (item.category === 'character' ? '人物' : item.category === 'prop' ? '物品' : item.category === 'scene' ? '场景' : '资产')
+  const name = String(item.name || '').trim()
+  return name ? `${prefix}-${name}` : prefix
+}
+
+function scriptAssetNodeDimensions(aspectRatio = '16:9') {
+  const parts = String(aspectRatio || '1:1').split(':')
+  const widthRatio = parseFloat(parts[0]) || 1
+  const heightRatio = parseFloat(parts[1]) || 1
+  if (widthRatio >= heightRatio) {
+    return { width: Math.round(280 * (widthRatio / heightRatio)), height: 280 }
+  }
+  return { width: 280, height: Math.round(280 * (heightRatio / widthRatio)) }
+}
+
+function scriptAssetNodePosition(session, sourceNodeId, index, dimensions) {
+  const source = (session?.nodes || []).find(node => String(node?.id || '') === String(sourceNodeId || ''))
+  const sourceX = Number(source?.position?.x)
+  const sourceY = Number(source?.position?.y)
+  const baseX = Number.isFinite(sourceX) ? sourceX + Math.max(720, (source?.measured?.width || 280) + 120) : 360
+  const baseY = Number.isFinite(sourceY) ? sourceY : 260
+  return {
+    x: Math.round(baseX),
+    y: Math.round(baseY + index * ((dimensions?.height || 280) + 80)),
+  }
+}
+
+function buildScriptAssetImageNode({ item, nodeId, task, session, sourceNodeId, index, params }) {
+  const aspectRatio = normalizeImageAspectRatio(params.aspectRatio || '16:9')
+  const resolution = normalizeImageSizeLabel(params.size || '2K')
+  const dimensions = scriptAssetNodeDimensions(aspectRatio)
+  const createdAt = Date.now()
+  return {
+    id: nodeId,
+    type: 'image',
+    position: scriptAssetNodePosition(session, sourceNodeId, index, dimensions),
+    style: { width: `${dimensions.width}px`, height: `${dimensions.height}px` },
+    measured: dimensions,
+    data: {
+      model: params.modelName || OPENAI_MODEL,
+      modelName: params.modelName || OPENAI_MODEL,
+      style: '',
+      negativePrompt: '',
+      inputImageUrls: [],
+      result: null,
+      label: scriptAssetNodeLabel(item),
+      icon: 'image',
+      type: 'generation',
+      status: task?.taskId ? 'PENDING' : 'idle',
+      uploadProgress: null,
+      uploadError: null,
+      createdAt,
+      aspectRatio,
+      resolution,
+      batchSize: params.numImages || 1,
+      outputQuality: params.quality || 'high',
+      outputFormat: params.outputFormat || 'png',
+      prompt: item.prompt,
+      reviewed: false,
+      taskId: task?.taskId || '',
+      isGenerating: !!task?.taskId,
+      generatingMessage: task?.taskId ? '图片生成中...' : '',
+      source: 'script-asset-generator',
+      assetCategory: item.category,
+      assetName: item.name,
+      sourceNodeId: sourceNodeId || '',
+    },
+  }
+}
+
+function scriptAssetNodeEvent(node, sourceNodeId, index, total) {
+  return {
+    toolName: 'create_image_node',
+    nodeType: 'image',
+    nodeId: node.id,
+    label: node.data?.label || '图片',
+    referenceNodeIds: sourceNodeId ? [sourceNodeId] : [],
+    positionIndex: index,
+    totalCount: total,
+    customData: {
+      ...node.data,
+      _nodeStyle: node.style,
+    },
+  }
+}
+
+function upsertScriptAssetNodes(sessionId, nodes, edges) {
+  const session = ensureLocalSession(sessionId)
+  const nodeMap = new Map((session.nodes || []).map(node => [String(node.id || ''), node]))
+  nodes.forEach(node => nodeMap.set(String(node.id || ''), sanitizeForStore(node)))
+  session.nodes = Array.from(nodeMap.values())
+
+  const edgeMap = new Map((session.edges || []).map(edge => [itemKey(edge, 'edge'), edge]).filter(([key]) => key))
+  edges.forEach(edge => {
+    const key = itemKey(edge, 'edge')
+    if (key) edgeMap.set(key, sanitizeForStore(edge))
+  })
+  session.edges = Array.from(edgeMap.values())
+  session.updateTime = nowIso()
+  persistLocalStore()
+  return session
+}
+
+async function generateScriptAssetPromptContent(body = {}) {
+  const script = normalizeTextPrompt(body.script || body.prompt || body.text || body.content)
+  if (!script) throw new Error('请先填写剧本文本')
+  const selection = resolveTextModelSelection(body)
+  if (!selection.model) throw new Error('请在服务设置中配置文本 API 和文本/聊天模型')
+  if (!canUseOpenAIProfile(selection.profile)) throw new Error('请在服务设置中配置文本 API 地址和密钥')
+
+  const maxTokens = Math.max(parseInt(body.maxTokens || body.max_tokens || 8192) || 8192, 1024)
+  const temperatureValue = Number(body.temperature)
+  const temperature = Number.isFinite(temperatureValue) ? temperatureValue : 0.2
+  const openaiBody = {
+    model: selection.model,
+    messages: [
+      { role: 'system', content: scriptAssetPromptSystemText() },
+      { role: 'user', content: buildScriptAssetPromptInput(script, body) },
+    ],
+    max_tokens: maxTokens,
+    temperature,
+  }
+  const useStreaming = body.stream === true
+  console.log('[script-assets] preview start model=%s renderMode=%s chars=%d stream=%s', selection.model, normalizeScriptAssetRenderMode(body.renderMode || body.styleMode || body.style || body.artStyle), script.length, useStreaming ? 'true' : 'false')
+  const content = useStreaming
+    ? await openAIStreamChatText(openaiBody, selection.profile)
+    : extractChatCompletionText(await openAIRequest('POST', '/v1/chat/completions', { ...openaiBody, stream: false }, selection.profile))
+  if (!content) throw new Error('文本模型未返回资产提示词')
+  return {
+    content: content.trim(),
+    model: selection.model,
+    profileId: selection.profileId || ACTIVE_TEXT_OPENAI_PROFILE_ID,
   }
 }
 
@@ -217,6 +453,13 @@ function getActiveOpenAIProfile() {
     || OPENAI_PROFILES[0]
 }
 
+function getActiveTextOpenAIProfile() {
+  if (!Array.isArray(TEXT_OPENAI_PROFILES) || TEXT_OPENAI_PROFILES.length === 0) return null
+  return TEXT_OPENAI_PROFILES.find(profile => profile.id === ACTIVE_TEXT_OPENAI_PROFILE_ID)
+    || TEXT_OPENAI_PROFILES.find(profile => profile.baseUrl && profile.apiKey)
+    || TEXT_OPENAI_PROFILES[0]
+}
+
 function refreshActiveOpenAIGlobals() {
   const active = getActiveOpenAIProfile()
   ACTIVE_OPENAI_PROFILE_ID = active?.id || ''
@@ -225,10 +468,20 @@ function refreshActiveOpenAIGlobals() {
   OPENAI_MODEL = active?.model || config.openaiModel || 'gpt-4o'
 }
 
+function refreshActiveTextOpenAIGlobals() {
+  const active = getActiveTextOpenAIProfile()
+  ACTIVE_TEXT_OPENAI_PROFILE_ID = active?.id || ''
+  TEXT_OPENAI_BASE = (active?.baseUrl || '').replace(/\/+$/, '')
+  TEXT_OPENAI_KEY = active?.apiKey || ''
+  TEXT_OPENAI_MODEL = active?.model || config.textOpenaiModel || ''
+}
+
 function applyOpenAIConfigPayload(payload = {}) {
-  if (Array.isArray(payload.openaiProfiles)) {
-    OPENAI_PROFILES = normalizeOpenAIProfiles({ openaiProfiles: payload.openaiProfiles })
-    ACTIVE_OPENAI_PROFILE_ID = String(payload.activeOpenaiProfileId || ACTIVE_OPENAI_PROFILE_ID || OPENAI_PROFILES[0]?.id || '')
+  const imageProfiles = Array.isArray(payload.imageOpenaiProfiles) ? payload.imageOpenaiProfiles : payload.openaiProfiles
+  const activeImageProfileId = payload.activeImageOpenaiProfileId !== undefined ? payload.activeImageOpenaiProfileId : payload.activeOpenaiProfileId
+  if (Array.isArray(imageProfiles)) {
+    OPENAI_PROFILES = normalizeOpenAIProfiles({ openaiProfiles: imageProfiles })
+    ACTIVE_OPENAI_PROFILE_ID = String(activeImageProfileId || ACTIVE_OPENAI_PROFILE_ID || OPENAI_PROFILES[0]?.id || '')
   } else {
     const hasLegacy = payload.openaiBaseUrl !== undefined || payload.openaiApiKey !== undefined || payload.openaiModel !== undefined
     if (hasLegacy) {
@@ -244,8 +497,8 @@ function applyOpenAIConfigPayload(payload = {}) {
       }, 0)]
       ACTIVE_OPENAI_PROFILE_ID = id
     }
-    if (payload.activeOpenaiProfileId !== undefined) {
-      ACTIVE_OPENAI_PROFILE_ID = String(payload.activeOpenaiProfileId || '')
+    if (activeImageProfileId !== undefined) {
+      ACTIVE_OPENAI_PROFILE_ID = String(activeImageProfileId || '')
     }
   }
   refreshActiveOpenAIGlobals()
@@ -258,11 +511,44 @@ function applyOpenAIConfigPayload(payload = {}) {
     OPENAI_STREAMING_ENABLED = normalizeOpenAIStreamingEnabled(payload)
   }
   config.openaiProfiles = OPENAI_PROFILES
+  config.imageOpenaiProfiles = OPENAI_PROFILES
   config.activeOpenaiProfileId = ACTIVE_OPENAI_PROFILE_ID
+  config.activeImageOpenaiProfileId = ACTIVE_OPENAI_PROFILE_ID
   config.openaiBaseUrl = OPENAI_BASE
   config.openaiApiKey = OPENAI_KEY
   config.openaiModel = OPENAI_MODEL
   config.openaiStreamingEnabled = OPENAI_STREAMING_ENABLED
+}
+
+function applyTextOpenAIConfigPayload(payload = {}) {
+  if (Array.isArray(payload.textOpenaiProfiles)) {
+    TEXT_OPENAI_PROFILES = normalizeOpenAIProfiles({ openaiProfiles: payload.textOpenaiProfiles })
+    ACTIVE_TEXT_OPENAI_PROFILE_ID = String(payload.activeTextOpenaiProfileId || ACTIVE_TEXT_OPENAI_PROFILE_ID || TEXT_OPENAI_PROFILES[0]?.id || '')
+  } else {
+    const hasLegacy = payload.textOpenaiBaseUrl !== undefined || payload.textOpenaiApiKey !== undefined || payload.textOpenaiModel !== undefined
+    if (hasLegacy) {
+      const active = getActiveTextOpenAIProfile() || {}
+      const id = ACTIVE_TEXT_OPENAI_PROFILE_ID || active.id || 'text_default'
+      TEXT_OPENAI_PROFILES = [normalizeOpenAIProfile({
+        ...active,
+        id,
+        name: active.name || payload.textOpenaiProfileName || '文本配置',
+        baseUrl: payload.textOpenaiBaseUrl !== undefined ? payload.textOpenaiBaseUrl : active.baseUrl,
+        apiKey: payload.textOpenaiApiKey !== undefined ? payload.textOpenaiApiKey : active.apiKey,
+        model: payload.textOpenaiModel !== undefined ? payload.textOpenaiModel : active.model,
+      }, 0)]
+      ACTIVE_TEXT_OPENAI_PROFILE_ID = id
+    }
+    if (payload.activeTextOpenaiProfileId !== undefined) {
+      ACTIVE_TEXT_OPENAI_PROFILE_ID = String(payload.activeTextOpenaiProfileId || '')
+    }
+  }
+  refreshActiveTextOpenAIGlobals()
+  config.textOpenaiProfiles = TEXT_OPENAI_PROFILES
+  config.activeTextOpenaiProfileId = ACTIVE_TEXT_OPENAI_PROFILE_ID
+  config.textOpenaiBaseUrl = TEXT_OPENAI_BASE
+  config.textOpenaiApiKey = TEXT_OPENAI_KEY
+  config.textOpenaiModel = TEXT_OPENAI_MODEL
 }
 
 function removedModuleInterceptor(req, res, next) {
@@ -709,7 +995,13 @@ function applyBatchOperation(sessionId, actions = []) {
 }
 
 function isLocalGeneratedTaskId(taskId) {
-  return /^gen_task_/.test(String(taskId || ''))
+  return /^(gen_task_|text_task_)/.test(String(taskId || ''))
+}
+
+function taskDataTypeFromId(taskId) {
+  const id = String(taskId || '')
+  if (id.startsWith('text_task_')) return 'text'
+  return 'image'
 }
 
 function normalizeTaskResultData(resultData) {
@@ -717,13 +1009,34 @@ function normalizeTaskResultData(resultData) {
   return items.map(item => {
     if (typeof item === 'string') return item
     if (item && typeof item === 'object') {
-      return item.url || item.imageUrl || item.videoUrl || item.audioUrl || item.resultUrl || ''
+      return item.url || item.imageUrl || item.videoUrl || item.audioUrl || item.resultUrl || item.textContent || item.content || item.text || item.output_text || ''
     }
     return ''
   }).filter(Boolean)
 }
 
-function nodeResultData(data = {}) {
+function nodeDataType(node = {}) {
+  const type = String(node?.type || node?.data?.dataType || '').toLowerCase()
+  if (type.includes('video')) return 'video'
+  if (type.includes('text') || type.includes('markdown')) return 'text'
+  if (type.includes('audio') || type.includes('music')) return 'audio'
+  return 'image'
+}
+
+function nodeTextResultData(data = {}) {
+  const candidates = [data.result, data.textContent, data.content, data.generatedText, data.outputText]
+  for (const item of candidates) {
+    if (typeof item === 'string' && item.trim()) return [item.trim()]
+    if (item && typeof item === 'object') {
+      const text = normalizeTaskResultData(item).join('\n\n').trim()
+      if (text) return [text]
+    }
+  }
+  return []
+}
+
+function nodeResultData(data = {}, dataType = 'image') {
+  if (dataType === 'text') return nodeTextResultData(data)
   const urls = normalizeTaskResultData(data.inputImageUrls)
   if (urls.length > 0) return urls
   if (data.result?.imageUrl) return [data.result.imageUrl]
@@ -740,7 +1053,7 @@ function localTaskStatusPayload(taskId) {
     return {
       taskId: id,
       nodeKey: '',
-      dataType: 'image',
+      dataType: taskDataTypeFromId(id),
       status: 'FAILED',
       resultData: [],
       errorMessage: '本地任务状态已丢失，请重新生成',
@@ -761,9 +1074,12 @@ function applyTaskPayloadToNode(node, payload) {
   if (!node?.data || !payload) return false
   if (payload.status !== 'SUCCESS' && payload.status !== 'FAILED') return false
   const data = node.data
+  const payloadDataType = String(payload.dataType || nodeDataType(node)).toLowerCase()
   const before = JSON.stringify({
     status: data.status,
     inputImageUrls: data.inputImageUrls,
+    result: data.result,
+    textContent: data.textContent,
     isGenerating: data.isGenerating,
     generatingMessage: data.generatingMessage,
     hasError: data.hasError,
@@ -774,18 +1090,28 @@ function applyTaskPayloadToNode(node, payload) {
   data.isGenerating = false
   data.generatingMessage = ''
   if (payload.status === 'SUCCESS') {
-    const urls = normalizeTaskResultData(payload.resultData)
-    if (urls.length > 0) data.inputImageUrls = urls
+    const resultData = normalizeTaskResultData(payload.resultData)
+    if (payloadDataType === 'text') {
+      const text = resultData.join('\n\n').trim()
+      if (text) {
+        data.result = text
+        data.textContent = text
+      }
+    } else if (resultData.length > 0) {
+      data.inputImageUrls = resultData
+    }
     data.hasError = false
     data.errorMessage = ''
   } else {
     data.hasError = true
-    data.errorMessage = payload.errorMessage || '图片生成失败'
+    data.errorMessage = payload.errorMessage || (payloadDataType === 'text' ? '文本生成失败' : '图片生成失败')
   }
 
   const after = JSON.stringify({
     status: data.status,
     inputImageUrls: data.inputImageUrls,
+    result: data.result,
+    textContent: data.textContent,
     isGenerating: data.isGenerating,
     generatingMessage: data.generatingMessage,
     hasError: data.hasError,
@@ -844,14 +1170,15 @@ function localLatestGeneration(nodeKey) {
   const found = findLocalNode(nodeKey)
   if (!found) return null
   const data = found.node.data || {}
+  const dataType = nodeDataType(found.node)
   const status = String(data.status || '').toUpperCase()
   if (status === 'SUCCESS') {
     return {
       taskId: data.taskId || null,
       nodeKey,
-      dataType: found.node.type === 'video' ? 'video' : 'image',
+      dataType,
       status: 'SUCCESS',
-      resultData: nodeResultData(data),
+      resultData: nodeResultData(data, dataType),
       errorMessage: null,
     }
   }
@@ -861,7 +1188,7 @@ function localLatestGeneration(nodeKey) {
     return {
       taskId: data.taskId || null,
       nodeKey,
-      dataType: found.node.type === 'video' ? 'video' : 'image',
+      dataType,
       status: 'FAILED',
       resultData: [],
       errorMessage: data.errorMessage || '生成失败',
@@ -933,6 +1260,7 @@ function toolTypeFromSource(source) {
   if (value.includes('outpaint')) return 'IMAGE_OUTPAINTING'
   if (value.includes('light')) return 'LIGHTING_MODIFICATION'
   if (value.includes('upscale')) return 'IMAGE_UPSCALE'
+  if (value.includes('text')) return 'TEXT_GENERATION'
   return 'IMAGE_GENERATION'
 }
 
@@ -942,7 +1270,10 @@ function generationTypeFromRecord(record = {}) {
 }
 
 function generationRecordView(record = {}) {
-  const urls = normalizeTaskResultData(record.resultData || record.urls || record.url)
+  const dataType = record.dataType || record.assetType || 'image'
+  const resultItems = normalizeTaskResultData(record.resultData || record.urls || record.url || record.textContent)
+  const textContent = dataType === 'text' ? (record.textContent || resultItems.join('\n\n')).trim() : (record.textContent || '')
+  const urls = dataType === 'text' ? [] : resultItems
   const createTime = record.createTime || record.createdAt || nowIso()
   const updateTime = record.updateTime || createTime
   return {
@@ -950,8 +1281,8 @@ function generationRecordView(record = {}) {
     taskId: record.taskId || null,
     nodeKey: record.nodeKey || '',
     sessionId: record.sessionId || '',
-    dataType: record.dataType || 'image',
-    assetType: record.assetType || record.dataType || 'image',
+    dataType,
+    assetType: record.assetType || dataType,
     status: statusToLocalStatus(record.status),
     source: record.source || 'generate-image',
     toolType: record.toolType || toolTypeFromSource(record.source),
@@ -965,10 +1296,11 @@ function generationRecordView(record = {}) {
     promptPresetId: record.promptPresetId || '',
     promptPresetLabel: record.promptPresetLabel || '',
     inputImageUrls: normalizeImageUrlList(record.inputImageUrls),
-    resultData: urls,
+    resultData: dataType === 'text' ? (textContent ? [textContent] : resultItems) : urls,
     urls,
     url: urls[0] || '',
     imageUrl: urls[0] || '',
+    textContent,
     errorMessage: record.errorMessage || null,
     createTime,
     updateTime,
@@ -984,6 +1316,11 @@ function generationRecordView(record = {}) {
       url: urls[0] || '',
       imageUrl: urls[0] || '',
       inputImageUrls: normalizeImageUrlList(record.inputImageUrls),
+    },
+    textRef: {
+      content: textContent,
+      prompt: record.prompt || '',
+      modelName: record.modelName || record.model || OPENAI_MODEL || '',
     },
   }
 }
@@ -1059,6 +1396,27 @@ function upsertAssetRecord(record = {}) {
 
 function recordAssetsForGeneration(record = {}) {
   const view = generationRecordView(record)
+  if (view.dataType === 'text') {
+    const textContent = String(view.textContent || view.resultData?.[0] || '').trim()
+    if (!textContent) return
+    upsertAssetRecord({
+      id: `asset_${view.taskId || view.id}_text_${shortHash(textContent)}`,
+      generationId: view.id,
+      taskId: view.taskId,
+      nodeKey: view.nodeKey,
+      sessionId: view.sessionId,
+      assetType: 'text',
+      dataType: 'text',
+      source: view.source,
+      prompt: view.prompt,
+      toolType: 'TEXT_GENERATION',
+      textContent,
+      name: '文本素材',
+      createTime: view.createTime,
+      updateTime: view.updateTime,
+    })
+    return
+  }
   view.urls.forEach((url, index) => {
     upsertAssetRecord({
       id: `asset_${view.taskId || view.id}_${index}_${shortHash(url)}`,
@@ -1149,15 +1507,34 @@ function hydrateLocalRecordsFromSessions() {
     ;(session.nodes || []).forEach(node => {
       const data = node?.data || {}
       const nodeKey = node?.id || ''
-      const resultUrls = nodeResultData(data)
-      resultUrls.forEach((url, index) => {
+      const dataType = nodeDataType(node)
+      const resultData = nodeResultData(data, dataType)
+      if (dataType === 'text' && resultData.length > 0) {
+        const textContent = resultData.join('\n\n').trim()
+        const asset = upsertAssetRecord({
+          id: `asset_node_${nodeKey}_text_${shortHash(textContent)}`,
+          taskId: data.taskId || null,
+          nodeKey,
+          sessionId,
+          assetType: 'text',
+          dataType: 'text',
+          source: data.type || data.mediaSource || 'node',
+          prompt: data.prompt || data.localPrompt || '',
+          textContent,
+          name: data.label || '文本素材',
+          createTime: isoFromTime(data.createdAt || session.createTime),
+          updateTime: session.updateTime || nowIso(),
+        })
+        if (asset) changed = true
+      }
+      if (dataType !== 'text') resultData.forEach((url, index) => {
         const asset = upsertAssetRecord({
           id: `asset_node_${nodeKey}_${index}_${shortHash(url)}`,
           taskId: data.taskId || null,
           nodeKey,
           sessionId,
-          assetType: node.type === 'video' ? 'video' : 'image',
-          dataType: node.type === 'video' ? 'video' : 'image',
+          assetType: dataType === 'video' ? 'video' : 'image',
+          dataType: dataType === 'video' ? 'video' : 'image',
           source: data.type || data.mediaSource || 'node',
           prompt: data.prompt || data.localPrompt || '',
           url,
@@ -1176,14 +1553,15 @@ function hydrateLocalRecordsFromSessions() {
         taskId: data.taskId,
         nodeKey,
         sessionId,
-        dataType: node.type === 'video' ? 'video' : 'image',
+        dataType,
         status,
         source: data.type || 'generate-image',
         prompt: data.prompt || data.localPrompt || '',
         model: data.model || data.modelName || '',
         modelName: data.modelName || data.model || '',
         inputImageUrls: data.connectedImageUrls || [],
-        resultData: status === 'SUCCESS' ? resultUrls : [],
+        resultData: status === 'SUCCESS' ? resultData : [],
+        textContent: dataType === 'text' ? resultData.join('\n\n') : '',
         errorMessage: data.errorMessage || null,
         createTime: isoFromTime(data.createdAt || session.createTime),
         updateTime: session.updateTime || nowIso(),
@@ -1211,7 +1589,11 @@ function listLocalGenerationRecords(query = {}) {
   if (nodeKey) rows = rows.filter(row => String(row.nodeKey || '') === nodeKey)
   if (sessionId) rows = rows.filter(row => String(row.sessionId || '') === sessionId)
   if (status && status !== 'ALL') rows = rows.filter(row => String(row.status || '').toUpperCase() === status)
-  if (!status) rows = rows.filter(row => String(row.status || '').toUpperCase() === 'SUCCESS' && normalizeTaskResultData(row.urls || row.resultData || row.url).length > 0)
+  if (!status) rows = rows.filter(row => {
+    if (String(row.status || '').toUpperCase() !== 'SUCCESS') return false
+    if (row.dataType === 'text') return !!String(row.textContent || row.resultData?.[0] || '').trim()
+    return normalizeTaskResultData(row.urls?.length ? row.urls : (row.resultData || row.url)).length > 0
+  })
   rows.sort((a, b) => String(b.updateTime || b.createTime || '').localeCompare(String(a.updateTime || a.createTime || '')))
   const { pageNum, pageSize } = pageFromQuery(query)
   const start = (pageNum - 1) * pageSize
@@ -1255,6 +1637,16 @@ function findLocalAssetRef(taskId) {
   if (generation) return generation
   const asset = ensureAssetRecords().map(assetRecordView).find(item => item.taskId === id || item.id === id || item.generationId === id)
   if (!asset) return null
+  if (asset.dataType === 'text' || asset.assetType === 'text') {
+    return {
+      ...asset,
+      resultData: asset.textContent ? [asset.textContent] : [],
+      textRef: {
+        content: asset.textContent || '',
+        prompt: asset.prompt || '',
+      },
+    }
+  }
   return {
     ...asset,
     resultData: asset.urls,
@@ -1441,20 +1833,21 @@ const aiTasks = new Map()
 const runEvents = new Map()
 
 // ── OpenAI API helpers ──
-function resolveOpenAIUrl(apiPath) {
-  const base = OPENAI_BASE.replace(/\/+$/, '')
+function resolveOpenAIUrl(apiPath, profile = null) {
+  const base = (profile?.baseUrl || OPENAI_BASE).replace(/\/+$/, '')
   // 如果 base 已经包含版本前缀（如 /v1），去掉 apiPath 中的版本前缀
   const hasVer = /\/v\d+$/.test(base)
   const path = hasVer ? apiPath.replace(/^\/v\d+/, '') : apiPath
   return base + path
 }
 
-function openAIRequest(method, apiPath, body) {
+function openAIRequest(method, apiPath, body, profile = null) {
   return new Promise((resolve, reject) => {
-    const fullUrl = resolveOpenAIUrl(apiPath)
+    const fullUrl = resolveOpenAIUrl(apiPath, profile)
     const parsed = new URL(fullUrl)
     const bodyStr = body ? JSON.stringify(body) : null
     console.log('[openAI] %s %s body=%s', method, fullUrl, bodyStr ? bodyStr.slice(0, 300) : '(empty)')
+    const apiKey = profile?.apiKey || OPENAI_KEY
     const options = {
       hostname: parsed.hostname,
       port: parsed.port || (parsed.protocol === 'https:' ? 443 : 80),
@@ -1462,7 +1855,7 @@ function openAIRequest(method, apiPath, body) {
       method: method,
       headers: {
         'Content-Type': 'application/json',
-        'Authorization': `Bearer ${OPENAI_KEY}`,
+        'Authorization': `Bearer ${apiKey}`,
       }
     }
     if (bodyStr) options.headers['Content-Length'] = Buffer.byteLength(bodyStr)
@@ -1567,13 +1960,14 @@ function openAIFormRequest(method, apiPath, fields, files) {
   })
 }
 
-function openAIStreamChat(body, onEvent, onError, onDone) {
-  const base = OPENAI_BASE.replace(/\/+$/, '')
+function openAIStreamChat(body, onEvent, onError, onDone, profile = null) {
+  const base = (profile?.baseUrl || OPENAI_BASE).replace(/\/+$/, '')
   const hasVer = /\/v\d+$/.test(base)
   const path = hasVer ? '/chat/completions' : '/v1/chat/completions'
   const fullUrl = base + path
   const parsed = new URL(fullUrl)
   const bodyStr = JSON.stringify({ ...body, stream: true })
+  const apiKey = profile?.apiKey || OPENAI_KEY
   const options = {
     hostname: parsed.hostname,
     port: parsed.port || (parsed.protocol === 'https:' ? 443 : 80),
@@ -1581,7 +1975,7 @@ function openAIStreamChat(body, onEvent, onError, onDone) {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
-      'Authorization': `Bearer ${OPENAI_KEY}`,
+      'Authorization': `Bearer ${apiKey}`,
       'Accept': 'text/event-stream',
     }
   }
@@ -1590,6 +1984,27 @@ function openAIStreamChat(body, onEvent, onError, onDone) {
   const req = proto.request(options, (res) => {
     let buffer = ''
     let fullContent = ''
+    let done = false
+    const finish = () => {
+      if (done) return
+      done = true
+      if (onDone) onDone(fullContent)
+    }
+    if (res.statusCode >= 400) {
+      let errorData = ''
+      res.on('data', chunk => { errorData += chunk.toString('utf-8') })
+      res.on('end', () => {
+        let message = `API error ${res.statusCode}`
+        try {
+          const parsed = JSON.parse(errorData)
+          message = parsed.error?.message || parsed.message || message
+        } catch {
+          if (errorData.trim()) message = errorData.trim().slice(0, 200)
+        }
+        if (onError) onError(new Error(message))
+      })
+      return
+    }
     res.on('data', (chunk) => {
       buffer += chunk.toString('utf-8')
       const lines = buffer.split('\n')
@@ -1599,7 +2014,7 @@ function openAIStreamChat(body, onEvent, onError, onDone) {
         if (trimmed.startsWith('data: ')) {
           const jsonStr = trimmed.slice(6)
           if (jsonStr === '[DONE]') {
-            if (onDone) onDone(fullContent)
+            finish()
             return
           }
           try {
@@ -1610,13 +2025,16 @@ function openAIStreamChat(body, onEvent, onError, onDone) {
               if (onEvent) onEvent({ content: delta.content, fullContent })
             }
             if (data.choices?.[0]?.finish_reason) {
-              if (onDone) onDone(fullContent)
+              finish()
             }
           } catch { /* skip parse errors */ }
         }
       }
     })
-    res.on('end', () => {})
+    res.on('end', () => {
+      if (!done && fullContent) finish()
+      else if (!done && onError) onError(new Error('API 流式响应结束但未返回内容'))
+    })
   })
   req.setTimeout(480000, () => req.destroy(new Error('API 流式请求超时')))
   req.on('error', (err) => {
@@ -1702,6 +2120,14 @@ app.get('/settings-ui.js', (req, res) => {
   res.set('Cache-Control', 'no-store')
   res.type('application/javascript').sendFile(path.join(__dirname, 'settings-ui.js'))
 })
+app.get('/video-preview-fix.js', (req, res) => {
+  res.set('Cache-Control', 'no-store')
+  res.type('application/javascript').sendFile(path.join(__dirname, 'video-preview-fix.js'))
+})
+app.get('/script-assets-generator.js', (req, res) => {
+  res.set('Cache-Control', 'no-store')
+  res.type('application/javascript').sendFile(path.join(__dirname, 'script-assets-generator.js'))
+})
 app.get('/config.json', (req, res) => {
   if (fs.existsSync(configPath)) return res.type('application/json').sendFile(configPath)
   res.json(config)
@@ -1709,6 +2135,132 @@ app.get('/config.json', (req, res) => {
 
 app.get('/api/image-prompt-presets', (_req, res) => {
   res.json(mockSuccess(Object.values(IMAGE_PROMPT_PRESETS)))
+})
+
+app.post('/api/script-assets/preview', async (req, res) => {
+  try {
+    const body = req.body || {}
+    const textBody = { ...body }
+    if (body.textModelName || body.textModel || body.textModelCode) {
+      textBody.modelName = body.textModelName || body.textModel || body.textModelCode
+    } else {
+      delete textBody.modelName
+      delete textBody.model
+      delete textBody.modelCode
+    }
+    const textResult = await generateScriptAssetPromptContent(textBody)
+    const items = parseScriptAssetPromptOutput(textResult.content)
+    if (items.length === 0) {
+      return res.json({
+        success: false,
+        message: '没有解析到人物、物品或场景资产，请检查文本模型输出格式',
+        errMessage: '没有解析到人物、物品或场景资产，请检查文本模型输出格式',
+        data: { content: textResult.content, items: [] },
+      })
+    }
+    console.log('[script-assets] preview done items=%d', items.length)
+    res.json(mockSuccess({
+      content: textResult.content,
+      textModel: textResult.model,
+      textProfileId: textResult.profileId,
+      renderMode: normalizeScriptAssetRenderMode(body.renderMode || body.styleMode || body.style || body.artStyle),
+      items,
+    }))
+  } catch (err) {
+    console.error('[script-assets] 预览失败:', err.message)
+    res.json({
+      success: false,
+      message: err.message || '根据剧本生成资产失败',
+      errMessage: err.message || '根据剧本生成资产失败',
+    })
+  }
+})
+
+app.post('/api/script-assets/create', async (req, res) => {
+  try {
+    const body = req.body || {}
+    const sessionId = String(body.sessionId || body.workspaceId || DEFAULT_SESSION_ID).trim() || DEFAULT_SESSION_ID
+    const sourceNodeId = String(body.sourceNodeId || body.nodeId || body.nodeKey || '').trim()
+    const session = ensureLocalSession(sessionId)
+    const rawItems = Array.isArray(body.items) ? body.items : []
+    const items = rawItems
+      .map((item, index) => ({
+        id: item.id || `script_asset_item_${index + 1}`,
+        category: item.category || 'asset',
+        categoryLabel: item.categoryLabel || (item.category === 'character' ? '人物' : item.category === 'prop' ? '物品' : item.category === 'scene' ? '场景' : '资产'),
+        name: String(item.name || '').trim() || `资产${index + 1}`,
+        prompt: String(item.prompt || '').trim(),
+      }))
+      .filter(item => item.prompt)
+    if (items.length === 0) return res.json(mockFail('请至少选择一个资产进行生成'))
+
+    const params = {
+      modelName: body.imageModelName || body.modelName || body.imageModel || undefined,
+      aspectRatio: body.aspectRatio || '16:9',
+      size: body.size || '2K',
+      quality: body.quality || body.outputQuality || 'high',
+      outputFormat: body.outputFormat || 'png',
+      numImages: body.numImages ?? body.batchSize ?? 1,
+    }
+    const nodes = []
+    const edges = []
+    const tasks = []
+
+    items.forEach((item, index) => {
+      const nodeId = `script_asset_${uid()}`
+      const task = startStoryImageTask({
+        nodeKey: nodeId,
+        sessionId,
+        prompt: item.prompt,
+        modelName: params.modelName,
+        aspectRatio: params.aspectRatio,
+        numImages: params.numImages,
+        size: params.size,
+        quality: params.quality,
+        outputFormat: params.outputFormat,
+        source: 'script-asset-generator',
+      })
+      const node = buildScriptAssetImageNode({ item, nodeId, task, session, sourceNodeId, index, params })
+      nodes.push(node)
+      tasks.push({ nodeId, taskId: task.taskId, item })
+      if (sourceNodeId) {
+        edges.push({
+          id: `e-${sourceNodeId}-${nodeId}`,
+          source: sourceNodeId,
+          target: nodeId,
+          sourceHandle: 'text',
+          targetHandle: 'image',
+          type: 'default',
+          animated: false,
+        })
+      }
+    })
+
+    upsertScriptAssetNodes(sessionId, nodes, edges)
+    console.log('[script-assets] create done nodes=%d tasks=%d', nodes.length, tasks.length)
+    res.json(mockSuccess({
+      items,
+      nodes,
+      edges,
+      tasks,
+      nodeEvents: nodes.map((node, index) => scriptAssetNodeEvent(node, sourceNodeId, index, nodes.length)),
+    }))
+  } catch (err) {
+    console.error('[script-assets] 创建失败:', err.message)
+    res.json({
+      success: false,
+      message: err.message || '创建资产图片节点失败',
+      errMessage: err.message || '创建资产图片节点失败',
+    })
+  }
+})
+
+app.post('/api/script-assets/generate', async (req, res) => {
+  res.json({
+    success: false,
+    message: '请先预览并选择资产，再生成图片节点',
+    errMessage: '请先预览并选择资产，再生成图片节点',
+  })
 })
 
 // ── Redirect unwanted SPA routes to workflow ──
@@ -1719,15 +2271,25 @@ app.get(['/', '/neo-tv', '/home', '/inputSection'], (req, res) => {
 // ── Dynamic OpenAI config API (for settings UI) ──
 app.get('/api/openai-config', (req, res) => {
   const activeProfile = getActiveOpenAIProfile()
+  const activeTextProfile = getActiveTextOpenAIProfile()
   res.json({
     apiBaseUrl: API_BASE,
     apiKey: API_KEY,
     openaiProfiles: OPENAI_PROFILES,
+    imageOpenaiProfiles: OPENAI_PROFILES,
     activeOpenaiProfileId: ACTIVE_OPENAI_PROFILE_ID,
+    activeImageOpenaiProfileId: ACTIVE_OPENAI_PROFILE_ID,
     activeOpenaiProfile: activeProfile,
+    activeImageOpenaiProfile: activeProfile,
     openaiBaseUrl: OPENAI_BASE,
     openaiApiKey: OPENAI_KEY,
     openaiModel: OPENAI_MODEL,
+    textOpenaiProfiles: TEXT_OPENAI_PROFILES,
+    activeTextOpenaiProfileId: ACTIVE_TEXT_OPENAI_PROFILE_ID,
+    activeTextOpenaiProfile: activeTextProfile,
+    textOpenaiBaseUrl: TEXT_OPENAI_BASE,
+    textOpenaiApiKey: TEXT_OPENAI_KEY,
+    textOpenaiModel: TEXT_OPENAI_MODEL,
     openaiStreamingEnabled: OPENAI_STREAMING_ENABLED,
   })
 })
@@ -1737,13 +2299,15 @@ app.put('/api/openai-config', (req, res) => {
   if (apiBaseUrl !== undefined) API_BASE = apiBaseUrl.replace(/\/+$/, '')
   if (apiKey !== undefined) API_KEY = apiKey
   applyOpenAIConfigPayload(req.body || {})
+  applyTextOpenAIConfigPayload(req.body || {})
   config.apiBaseUrl = API_BASE
   config.apiKey = API_KEY
   if (outputFormat !== undefined) config.outputFormat = outputFormat
   config.openaiStreamingEnabled = OPENAI_STREAMING_ENABLED
   try { fs.writeFileSync(configPath, JSON.stringify(config, null, 2)) } catch (e) { console.error('[Config] save failed:', e.message) }
   const activeProfile = getActiveOpenAIProfile()
-  console.log(`[Config] API Base: ${API_BASE || '(mock)'} | OpenAI: ${activeProfile?.name || '(none)'} ${OPENAI_BASE} | Model: ${OPENAI_MODEL} | Key: ${OPENAI_KEY ? '✓' : '✗'} | Request: ${OPENAI_STREAMING_ENABLED ? 'stream' : 'non-stream'}`)
+  const activeTextProfile = getActiveTextOpenAIProfile()
+  console.log(`[Config] API Base: ${API_BASE || '(mock)'} | Image: ${activeProfile?.name || '(none)'} ${OPENAI_BASE} ${OPENAI_MODEL} | Text: ${activeTextProfile?.name || '(none)'} ${TEXT_OPENAI_BASE} ${TEXT_OPENAI_MODEL} | Request: ${OPENAI_STREAMING_ENABLED ? 'stream' : 'non-stream'}`)
   res.json({ success: true })
 })
 
@@ -1763,10 +2327,12 @@ app.use((req, res, next) => {
   const p = req.path
   const localStoryImageTaskPaths = new Set([
     '/agent/story-canvas/generate-image',
+    '/agent/story-canvas/generate-text',
     '/agent/story-canvas/batch-query-status',
     '/agent/story-canvas/latest-generation',
     '/agent/story-canvas/pose-reference',
     '/agent/story-canvas/convert-angle',
+    '/agent/story-cleaning/text-model-configs',
   ])
   if (p.startsWith('/assets/') || p === '/auth-mock.js') return next()
   if (p.startsWith('/local/') || p.startsWith('/generated/') || p.startsWith('/dify/')) return next()
@@ -2313,7 +2879,15 @@ app.use((req, res, next) => {
   }
   app.get('/agent/story-canvas/list-generations', sendGenerationList)
   app.post('/agent/story-canvas/list-generations', sendGenerationList)
-  app.post('/agent/story-canvas/generate-text', (req, res) => res.json(mockSuccess({ taskId: 'text_task_' + uid() })))
+  app.get('/agent/story-cleaning/text-model-configs', sendTextModelConfigs)
+  app.post('/agent/story-cleaning/text-model-configs', sendTextModelConfigs)
+  app.post('/agent/story-canvas/generate-text', (req, res) => {
+    try {
+      res.json(mockSuccess(startStoryTextTask(req.body || {})))
+    } catch (err) {
+      res.json(mockFail(err.message || '文本生成请求失败'))
+    }
+  })
   app.post('/agent/story-canvas/convert-angle', handleConvertAngleImageEdit)
   app.post('/agent/story-canvas/outpainting', (req, res) => res.json(mockSuccess({ taskId: 'outpaint_task_' + uid() })))
   app.post('/agent/story-canvas/generate-audio', (req, res) => res.json(mockSuccess({ taskId: 'audio_task_' + uid() })))
@@ -2572,9 +3146,10 @@ app.use((req, res, next) => {
     const emitter = new EventEmitter()
     runEvents.set(runId, emitter)
 
-    if (useOpenAI()) {
+    if (useTextOpenAI()) {
+      const textProfile = getActiveTextOpenAIProfile()
       const messages = [{ role: 'user', content: query || '' }]
-      const openaiBody = { model: OPENAI_MODEL, messages, max_tokens: 2048, temperature: 0.7 }
+      const openaiBody = { model: TEXT_OPENAI_MODEL, messages, max_tokens: 2048, temperature: 0.7 }
 
       if (OPENAI_STREAMING_ENABLED) {
         openAIStreamChat(
@@ -2584,7 +3159,7 @@ app.use((req, res, next) => {
               type: 'agent_result',
               data: {
                 type: 'content', content: event.content, role: 'assistant',
-                id: runId, model: OPENAI_MODEL,
+                id: runId, model: TEXT_OPENAI_MODEL,
                 created: Math.floor(Date.now() / 1000)
               }
             })
@@ -2597,19 +3172,20 @@ app.use((req, res, next) => {
           () => {
             emitter.emit('event', { type: 'done', data: { id: runId } })
             setTimeout(() => emitter.emit('close'), 500)
-          }
+          },
+          textProfile
         )
       } else {
         ;(async () => {
           try {
-            const resp = await openAIRequest('POST', '/v1/chat/completions', { ...openaiBody, stream: false })
+            const resp = await openAIRequest('POST', '/v1/chat/completions', { ...openaiBody, stream: false }, textProfile)
             const content = resp.choices?.[0]?.message?.content || ''
             if (content) {
               emitter.emit('event', {
                 type: 'agent_result',
                 data: {
                   type: 'content', content, role: 'assistant',
-                  id: runId, model: OPENAI_MODEL,
+                  id: runId, model: TEXT_OPENAI_MODEL,
                   created: Math.floor(Date.now() / 1000)
                 }
               })
@@ -2674,18 +3250,19 @@ app.use((req, res, next) => {
   app.post('/agent/scope/reply', (req, res) => res.json(mockSuccess({ replyId: 'reply_' + uid() })))
 
   app.get('/agent/scope/models', async (req, res) => {
-    if (!useOpenAI()) return res.json(mockSuccess([]))
+    if (!useTextOpenAI()) return res.json(mockSuccess([]))
     try {
-      const resp = await openAIRequest('GET', '/v1/models')
+      const textProfile = getActiveTextOpenAIProfile()
+      const resp = await openAIRequest('GET', '/v1/models', null, textProfile)
       const models = (resp.data || []).map(m => ({
         modelCode: m.id, name: m.id, description: '', tag: '', provider: 'openai', icon: '',
         isMultimodal: m.id.includes('vision') ? 1 : 0, requireMembership: 0,
-        isDefault: m.id === OPENAI_MODEL ? 1 : 0, inputPrice: null, outputPrice: null,
+        isDefault: m.id === TEXT_OPENAI_MODEL ? 1 : 0, inputPrice: null, outputPrice: null,
       }))
       res.json(mockSuccess(models))
     } catch {
       res.json(mockSuccess([{
-        modelCode: OPENAI_MODEL, name: OPENAI_MODEL, description: 'OpenAI compatible model',
+        modelCode: TEXT_OPENAI_MODEL, name: TEXT_OPENAI_MODEL, description: 'OpenAI compatible model',
         tag: '', provider: 'openai', icon: '', isMultimodal: 1,
         requireMembership: 0, isDefault: 1, inputPrice: null, outputPrice: null,
       }]))
@@ -2903,6 +3480,329 @@ app.use((req, res, next) => {
   function normalizeImageUrlList(value) {
     const list = Array.isArray(value) ? value : value ? [value] : []
     return list.map(item => String(item || '').trim()).filter(Boolean)
+  }
+
+  function normalizeTextPrompt(value) {
+    if (Array.isArray(value)) return value.map(normalizeTextPrompt).filter(Boolean).join('\n\n').trim()
+    if (typeof value === 'string') return value.replace(/[\u200B\u2060]/g, '').trim()
+    if (value && typeof value === 'object') {
+      return normalizeTaskResultData(value).join('\n\n').trim() || JSON.stringify(value)
+    }
+    return ''
+  }
+
+  function textFromMessageContent(content) {
+    if (typeof content === 'string') return content
+    if (Array.isArray(content)) {
+      return content.map(item => {
+        if (typeof item === 'string') return item
+        if (!item || typeof item !== 'object') return ''
+        return item.text || item.content || item.output_text || item.image_url?.url || ''
+      }).filter(Boolean).join('\n')
+    }
+    if (content && typeof content === 'object') {
+      return content.text || content.content || content.output_text || ''
+    }
+    return ''
+  }
+
+  function normalizeChatMessages(messages) {
+    if (!Array.isArray(messages)) return []
+    const allowedRoles = new Set(['system', 'user', 'assistant', 'developer', 'tool'])
+    return messages
+      .map(message => {
+        if (!message || typeof message !== 'object') return null
+        const role = allowedRoles.has(message.role) ? message.role : 'user'
+        const content = message.content ?? message.text ?? ''
+        if (Array.isArray(content)) return { role, content }
+        const text = normalizeTextPrompt(content)
+        return text ? { role, content: text } : null
+      })
+      .filter(Boolean)
+  }
+
+  function localImageUrlToChatUrl(imageUrl) {
+    const raw = String(imageUrl || '').trim()
+    if (!raw || raw.startsWith('data:image/')) return raw
+    try {
+      let pathname = raw
+      if (/^https?:\/\//i.test(raw)) {
+        const parsed = new URL(raw)
+        if (!['localhost', '127.0.0.1'].includes(parsed.hostname)) return raw
+        pathname = parsed.pathname
+      }
+      if (!pathname.startsWith('/generated/') && !pathname.startsWith('/dify/')) return raw
+      const relPath = pathname.startsWith('/generated/')
+        ? pathname.replace(/^\/generated\//, '')
+        : pathname.replace(/^\//, '')
+      const baseDir = path.resolve(imgDir)
+      const fp = path.resolve(imgDir, relPath)
+      if (!fp.startsWith(baseDir + path.sep) || !fs.existsSync(fp)) return raw
+      const mime = guessImageMime(fp)
+      return `data:${mime};base64,${fs.readFileSync(fp).toString('base64')}`
+    } catch {
+      return raw
+    }
+  }
+
+  function buildTextGenerationMessages(body = {}) {
+    const directMessages = normalizeChatMessages(body.messages)
+    if (directMessages.length > 0) return directMessages
+
+    const prompt = normalizeTextPrompt(body.prompt || body.query || body.text || body.content)
+    const imageUrls = normalizeImageUrlList(body.imageUrls || body.inputImageUrls || body.images)
+    const videoUrls = normalizeImageUrlList(body.videoUrls || body.inputVideoUrls || body.videos)
+    const audioUrls = normalizeImageUrlList(body.audioUrls || body.inputAudioUrls || body.audioUrl)
+    const contextLines = []
+    if (videoUrls.length > 0) contextLines.push(`参考视频链接：\n${videoUrls.join('\n')}`)
+    if (audioUrls.length > 0) contextLines.push(`参考音频链接：\n${audioUrls.join('\n')}`)
+    const userText = [prompt, contextLines.join('\n\n')].filter(Boolean).join('\n\n')
+    const userContent = imageUrls.length > 0
+      ? [
+          { type: 'text', text: userText || '请根据参考素材生成文本。' },
+          ...imageUrls.map(url => ({ type: 'image_url', image_url: { url: localImageUrlToChatUrl(url) } })),
+        ]
+      : userText
+
+    return [
+      {
+        role: 'system',
+        content: body.systemPrompt || '你是专业的漫剧、分镜和多媒体创作文本助手。请直接输出可用文本，不要解释请求过程。',
+      },
+      { role: 'user', content: userContent },
+    ]
+  }
+
+  function extractChatCompletionText(resp = {}) {
+    const choice = resp.choices?.[0] || {}
+    const message = choice.message || {}
+    const candidates = [
+      message.content,
+      choice.text,
+      resp.output_text,
+      resp.content,
+      resp.text,
+    ]
+    for (const item of candidates) {
+      const text = textFromMessageContent(item).trim()
+      if (text) return text
+    }
+    return ''
+  }
+
+  function openAIStreamChatText(body, profile = null) {
+    return new Promise((resolve, reject) => {
+      let settled = false
+      const finish = (fn, value) => {
+        if (settled) return
+        settled = true
+        fn(value)
+      }
+      openAIStreamChat(
+        body,
+        null,
+        err => finish(reject, err),
+        fullContent => finish(resolve, String(fullContent || '').trim()),
+        profile
+      )
+    })
+  }
+
+  function isLikelyImageModel(model = '') {
+    return /(gpt-image|dall-e|imagen|flux|stable-diffusion|midjourney)/i.test(String(model || ''))
+  }
+
+  function isLikelyTextModel(model = '') {
+    const value = String(model || '')
+    if (!value || isLikelyImageModel(value)) return false
+    return !/(embedding|rerank|moderation|tts|whisper|audio|speech|voice)/i.test(value)
+  }
+
+  function canUseOpenAIProfile(profile = null) {
+    return !!((profile?.baseUrl || TEXT_OPENAI_BASE) && (profile?.apiKey || TEXT_OPENAI_KEY))
+  }
+
+  function defaultTextModelName() {
+    const model = String(TEXT_OPENAI_MODEL || '').trim()
+    return isLikelyTextModel(model) ? model : ''
+  }
+
+  function textProfileConfigId(profileId) {
+    return `profile:${profileId}`
+  }
+
+  function openAIProfileById(profileId) {
+    const id = String(profileId || '').trim()
+    if (!id) return null
+    return TEXT_OPENAI_PROFILES.find(profile => String(profile.id || '') === id) || null
+  }
+
+  function resolveTextModelSelection(body = {}) {
+    const activeTextProfile = getActiveTextOpenAIProfile()
+    const explicit = String(body.modelName || body.model || body.modelCode || '').trim()
+    if (explicit) return { model: explicit, profile: activeTextProfile, profileId: activeTextProfile?.id || '' }
+    const configModel = String(body.textModelConfig?.modelName || body.textModelConfig?.modelCode || '').trim()
+    const configProfileId = String(body.textModelConfig?.profileId || '').trim()
+    if (configModel) {
+      const profile = openAIProfileById(configProfileId) || activeTextProfile
+      return { model: configModel, profile, profileId: profile?.id || configProfileId }
+    }
+    const id = String(body.textModelConfigId || body.modelConfigId || '').trim()
+    if (id.startsWith('profile:')) {
+      const profileId = id.replace(/^profile:/, '')
+      const profile = openAIProfileById(profileId)
+      if (profile?.baseUrl && profile?.apiKey && isLikelyTextModel(profile.model)) {
+        return { model: profile.model, profile, profileId }
+      }
+      return { model: '', profile: null, profileId }
+    }
+    if (id && !/^\d+$/.test(id) && id !== 'default' && !isLikelyImageModel(id)) {
+      return { model: id, profile: activeTextProfile, profileId: activeTextProfile?.id || '' }
+    }
+    return { model: defaultTextModelName(), profile: activeTextProfile, profileId: activeTextProfile?.id || '' }
+  }
+
+  async function openAITextModelConfigs() {
+    const active = getActiveTextOpenAIProfile()
+    const activeModel = active?.model || TEXT_OPENAI_MODEL || ''
+    const configs = []
+    TEXT_OPENAI_PROFILES.forEach(profile => {
+      if (profile?.baseUrl && profile?.apiKey && isLikelyTextModel(profile.model)) {
+        configs.push({
+          id: textProfileConfigId(profile.id),
+          model: profile.model,
+          profileId: profile.id,
+          profileName: profile.name || profile.id || 'OpenAI 配置',
+          displayName: `${profile.name || 'OpenAI 配置'} / ${profile.model}`,
+          isDefault: profile.id === ACTIVE_OPENAI_PROFILE_ID ? 1 : 0,
+        })
+      }
+    })
+    if (useTextOpenAI()) {
+      try {
+        const resp = await openAIRequest('GET', '/v1/models', null, active)
+        ;(resp.data || []).forEach(item => {
+          const id = String(item.id || item.model || '').trim()
+          if (isLikelyTextModel(id)) {
+            configs.push({
+              id,
+              model: id,
+              profileId: ACTIVE_TEXT_OPENAI_PROFILE_ID,
+              profileName: active?.name || '当前配置',
+              displayName: id,
+              isDefault: id === activeModel ? 1 : 0,
+            })
+          }
+        })
+      } catch (err) {
+        console.warn('[text-model-configs] 获取模型列表失败:', err.message)
+      }
+    }
+    if (canUseOpenAIProfile(active) && isLikelyTextModel(activeModel)) {
+      configs.push({
+        id: active?.id ? textProfileConfigId(active.id) : activeModel,
+        model: activeModel,
+        profileId: active?.id || ACTIVE_TEXT_OPENAI_PROFILE_ID,
+        profileName: active?.name || '当前配置',
+        displayName: active?.name ? `${active.name} / ${activeModel}` : activeModel,
+        isDefault: 1,
+      })
+    }
+    const seen = new Set()
+    return configs.filter(item => {
+      const key = `${item.id}:${item.model}`
+      if (seen.has(key)) return false
+      seen.add(key)
+      return true
+    }).map((item, index) => ({
+      id: item.id,
+      modelCode: item.model,
+      modelName: item.model,
+      profileId: item.profileId,
+      profileName: item.profileName,
+      displayName: item.displayName,
+      modelDescription: 'OpenAI 兼容文本模型',
+      provider: 'openai',
+      supportImageInput: 1,
+      supportVideoInput: 0,
+      supportAudioInput: 0,
+      pointsPerUnit: 0,
+      tokenUnit: 1000,
+      isDefault: item.isDefault || index === 0 ? 1 : 0,
+    }))
+  }
+
+  async function sendTextModelConfigs(_req, res) {
+    res.json(mockSuccess(await openAITextModelConfigs()))
+  }
+
+  function startStoryTextTask(body = {}) {
+    const messages = normalizeChatMessages(body.messages)
+    const prompt = normalizeTextPrompt(body.prompt || body.query || body.text || body.content)
+      || messages.map(message => textFromMessageContent(message.content)).filter(Boolean).join('\n\n').trim()
+    if (!prompt) throw new Error('prompt is required')
+
+    const taskId = 'text_task_' + uid()
+    const selection = resolveTextModelSelection(body)
+    const model = selection.model
+    if (!model) throw new Error('请在服务设置中配置文本 API 和文本/聊天模型')
+    if (!canUseOpenAIProfile(selection.profile)) throw new Error('请在服务设置中配置文本 API 地址和密钥')
+    const maxTokens = Math.max(parseInt(body.maxTokens || body.max_tokens || body.tokenLimit) || 2048, 1)
+    const temperatureValue = Number(body.temperature)
+    const temperature = Number.isFinite(temperatureValue) ? temperatureValue : 0.7
+    const inputImageUrls = normalizeImageUrlList(body.imageUrls || body.inputImageUrls || body.images)
+    const videoUrls = normalizeImageUrlList(body.videoUrls || body.inputVideoUrls || body.videos)
+    const audioUrls = normalizeImageUrlList(body.audioUrls || body.inputAudioUrls || body.audioUrl)
+    const taskMeta = {
+      taskId,
+      nodeKey: body.nodeKey || '',
+      sessionId: body.sessionId || body.workspaceId || '',
+      prompt,
+      inputImageUrls,
+      videoUrls,
+      audioUrls,
+      model,
+      openaiProfileId: selection.profileId || ACTIVE_OPENAI_PROFILE_ID,
+      openaiProfileName: selection.profile?.name || getActiveTextOpenAIProfile()?.name || '',
+      textModelConfigId: body.textModelConfigId || '',
+      source: 'generate-text',
+      dataType: 'text',
+      createdAt: Date.now(),
+    }
+    aiTasks.set(taskId, { status: 'processing', resultData: null, ...taskMeta })
+    recordGenerationStart(taskMeta)
+
+    ;(async () => {
+      try {
+        const openaiBody = {
+          model,
+          messages: buildTextGenerationMessages(body),
+          max_tokens: maxTokens,
+          temperature,
+        }
+        console.log('[generate-text] 请求 model=%s profile=%s prompt=%s... stream=%s', model, selection.profileId || ACTIVE_TEXT_OPENAI_PROFILE_ID || 'active', prompt.slice(0, 80), OPENAI_STREAMING_ENABLED ? 'true' : 'false')
+        const content = OPENAI_STREAMING_ENABLED
+          ? await openAIStreamChatText(openaiBody, selection.profile)
+          : extractChatCompletionText(await openAIRequest('POST', '/v1/chat/completions', { ...openaiBody, stream: false }, selection.profile))
+        if (!content) throw new Error('模型未返回文本内容')
+        aiTasks.set(taskId, { status: 'completed', resultData: [content], textContent: content, ...taskMeta })
+        recordGenerationFinal(taskId)
+        syncTaskResultToLocalNodes(taskId)
+        console.log('[generate-text] 成功 taskId=%s chars=%d', taskId, content.length)
+      } catch (err) {
+        console.error('[generate-text] 失败:', err.message)
+        aiTasks.set(taskId, {
+          status: 'failed',
+          resultData: [],
+          errorMessage: err.message || '文本生成失败',
+          ...taskMeta,
+        })
+        recordGenerationFinal(taskId)
+        syncTaskResultToLocalNodes(taskId)
+      }
+    })()
+
+    return { taskId, status: 'PROCESSING', model }
   }
 
   function buildAnglePrompt({ prompt, horizontalAngle, verticalAngle, zoomLevel, wideangle }) {
@@ -3154,18 +4054,19 @@ app.use((req, res, next) => {
   app.post('/agent/canvas/material/lip-sync', (req, res) => res.json(mockSuccess({ taskId: uid(), status: 'PENDING' })))
   app.post('/agent/canvas/shot/extend-video', (req, res) => res.json(mockSuccess({ taskId: uid() })))
   app.post('/agent/canvas/shot/optimize-prompt', async (req, res) => {
-    if (!useOpenAI()) return res.json(mockSuccess({ optimizedPrompt: req.body?.prompt || '' }))
+    if (!useTextOpenAI()) return res.json(mockSuccess({ optimizedPrompt: req.body?.prompt || '' }))
     try {
       const { prompt } = req.body || {}
       if (prompt) {
+        const textProfile = getActiveTextOpenAIProfile()
         const resp = await openAIRequest('POST', '/v1/chat/completions', {
-          model: OPENAI_MODEL,
+          model: TEXT_OPENAI_MODEL,
           messages: [
             { role: 'system', content: '你是一个视频/图像提示词优化专家。请将用户的提示词优化为更详细、更专业的英文提示词，适合AI图像/视频生成模型使用。直接返回优化后的提示词，不要加解释。' },
             { role: 'user', content: prompt }
           ],
           max_tokens: 512, temperature: 0.7,
-        })
+        }, textProfile)
         const optimized = resp.choices?.[0]?.message?.content || prompt
         return res.json(mockSuccess({ optimizedPrompt: optimized }))
       }
@@ -3248,11 +4149,18 @@ const localServer = app.listen(PORT, () => {
     console.log(`║  Mode:   Mock (no proxy)`)
   }
   if (useOpenAI()) {
-    console.log(`║  OpenAI: ${OPENAI_BASE}`)
-    console.log(`║  OpenAI Model: ${OPENAI_MODEL}`)
-    console.log(`║  OpenAI Key: ${OPENAI_KEY ? '✓ set' : '✗ not set'}`)
+    console.log(`║  Image API: ${OPENAI_BASE}`)
+    console.log(`║  Image Model: ${OPENAI_MODEL}`)
+    console.log(`║  Image Key: ${OPENAI_KEY ? '✓ set' : '✗ not set'}`)
   } else {
-    console.log(`║  OpenAI: not configured (AI responses will be mock)`)
+    console.log(`║  Image API: not configured (image responses will be mock)`)
+  }
+  if (useTextOpenAI()) {
+    console.log(`║  Text API:  ${TEXT_OPENAI_BASE}`)
+    console.log(`║  Text Model: ${TEXT_OPENAI_MODEL}`)
+    console.log(`║  Text Key:  ${TEXT_OPENAI_KEY ? '✓ set' : '✗ not set'}`)
+  } else {
+    console.log(`║  Text API:  not configured`)
   }
   console.log(`╚══════════════════════════════════════════╝`)
 })
